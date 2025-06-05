@@ -21,6 +21,7 @@
 注意事项:
     - 脚本设计了随机延时机制，以避免频繁请求被网站限制
     - 支持键盘中断(Ctrl+C)，中断时会保存已收集的数据
+    - 支持从已存在的CSV缓存文件中读取数据，避免重复查询
 """
 
 import os
@@ -54,15 +55,54 @@ def save_summary_data_to_csv(data_list, save_path, filename):
     except Exception as e:
         print(f"\\n保存总结CSV时发生错误: {str(e)}")
 
+
+def load_cached_data(save_path, filename):
+    """
+    从CSV文件中加载缓存数据。
+    
+    参数:
+        save_path (str): CSV文件的保存路径。
+        filename (str): CSV文件的名称。
+        
+    返回:
+        dict: 以ticker为键，连续Strong Buy天数为值的字典。
+        list: 包含所有缓存数据的原始列表格式。
+    """
+    cached_data_dict = {}
+    cached_data_list = []
+    
+    cache_file_path = os.path.join(save_path, filename)
+    if os.path.exists(cache_file_path):
+        try:
+            cached_df = pd.read_csv(cache_file_path)
+            cached_data_list = cached_df.to_dict('records')
+            
+            # 转换为字典格式以便快速查找
+            for record in cached_data_list:
+                if 'Ticker' in record and 'RecentStrongBuyStreakDays' in record:
+                    cached_data_dict[record['Ticker']] = record['RecentStrongBuyStreakDays']
+            
+            print(f"已从 {cache_file_path} 加载 {len(cached_data_dict)} 条缓存数据")
+        except Exception as e:
+            print(f"读取缓存文件时发生错误: {str(e)}")
+    else:
+        print(f"未找到缓存文件: {cache_file_path}")
+    
+    return cached_data_dict, cached_data_list
+
 if __name__ == "__main__":
     picker_list_url = "https://seekingalpha.com/screeners/967f241ea593-MyAlphaPicker" #MyAlphaPicker列表
     current_save_path = "." 
     summary_filename = "alpha_picker_strong_buy_summary.csv"
     
-    results_for_csv = [] 
+    # 加载缓存数据
+    cached_ticker_data, cached_results = load_cached_data(current_save_path, summary_filename)
+    
+    results_for_csv = cached_results.copy() if cached_results else []
     driver = None 
     ticker_processed_count = 0 # 初始化已处理ticker的计数器
     long_delay_interval = 10 # 每处理10个ticker后执行长延时
+    long_delay_interval_2 = 40 # 每处理10个ticker后执行长延时
 
     try:
         chrome_options = Options()
@@ -72,7 +112,7 @@ if __name__ == "__main__":
 
         # 获取MyAlphaPicker列表
         print("获取MyAlphaPicker列表...")
-        my_alpha_picker_data = connect_parse_screener_picker_list(picker_list_url, driver, b_save_webpage_csv=True)
+        my_alpha_picker_data = connect_parse_screener_picker_list(picker_list_url, driver, b_save_webpage_csv=False)
         
         # 从数据中提取ticker列表
         my_alpha_pickers = [stock['ticker'] for stock in my_alpha_picker_data if 'ticker' in stock]
@@ -91,7 +131,7 @@ if __name__ == "__main__":
         # 获取投资组合
         print("获取持仓组合...")
         my_holdings_url = "https://seekingalpha.com/account/portfolio/summary?portfolioId=63326124"
-        my_holdings_data = connect_parse_portfolio_picker_list(my_holdings_url, driver, b_save_webpage_csv=True)
+        my_holdings_data = connect_parse_portfolio_picker_list(my_holdings_url, driver, b_save_webpage_csv=False)
         
         # 从数据中提取ticker列表
         my_holdings = [stock['ticker'] for stock in my_holdings_data if 'ticker' in stock]
@@ -128,50 +168,63 @@ if __name__ == "__main__":
 
         # 从my_alpha_pickers中去掉my_holdings和my_watch_list中的股票
         all_tickers = [ticker for ticker in my_alpha_pickers if ticker not in my_holdings and ticker not in my_watch_list]
-        print(f"\\n将为以下股票代码分析 Quant Ratings: {len(all_tickers)}个 - {all_tickers}")
+        
+        # 过滤掉已经在缓存中的股票
+        tickers_to_process = [ticker for ticker in all_tickers if ticker not in cached_ticker_data]
+        
+        print(f"\n总共有 {len(all_tickers)} 个股票需要分析")
+        print(f"缓存中已有 {len(cached_ticker_data)} 个股票的数据")
+        print(f"\n将为以下 {len(tickers_to_process)} 个未缓存的股票代码分析 Quant Ratings: {tickers_to_process}")
 
-        if not all_tickers:
-            print("未能从 MyAlphaPicker 页面提取到任何股票代码，程序终止。")
+        if not tickers_to_process:
+            print("所有股票已存在于缓存中，无需重新查询。")
         else:
-            print(f"\\n将为以下股票代码分析 Quant Ratings: {len(all_tickers)}个 - {all_tickers}")
+            print(f"\n将为以下股票代码分析 Quant Ratings: {len(tickers_to_process)}个 - {tickers_to_process}")
 
-            for ticker_name in all_tickers:
+            for ticker_name in tickers_to_process:
                 ticker_processed_count += 1 # 递增计数器
 
                 # 每处理一定数量的ticker后，执行一次较长的随机延时
                 if ticker_processed_count % long_delay_interval == 0 and ticker_processed_count > 0:
                     long_random_delay = random.uniform(10, 30) # 10到30秒的长延时
-                    print(f"\\n已处理 {ticker_processed_count} 个ticker，执行额外长延时 {long_random_delay:.2f} 秒...")
+                    print(f"\n已处理 {ticker_processed_count} 个ticker，执行额外长延时 {long_random_delay:.2f} 秒...")
                     time.sleep(long_random_delay)
 
-                print(f"\\n--- 开始处理 Ticker ({ticker_processed_count}/{len(all_tickers)}): {ticker_name} ---")
+                if ticker_processed_count % long_delay_interval_2 == 0 and ticker_processed_count > 0:
+                    long_random_delay = random.uniform(60, 180) # 60到180秒的长延时
+                    print(f"\n已处理 {ticker_processed_count} 个ticker，执行额外长延时 {long_random_delay:.2f} 秒...")
+                    time.sleep(long_random_delay)
+
+
+
+                print(f"\n--- 开始处理 Ticker ({ticker_processed_count}/{len(tickers_to_process)}): {ticker_name} ---")
                 # ticker_rating_url = f"https://seekingalpha.com/symbol/{ticker_name}/ratings/quant-ratings"
                 
                 streak_days = parse_ticker_rating_days(
                     ticker_name,
                     save_path=current_save_path,
                     driver=driver,
-                    b_save_webpage=True,
+                    b_save_webpage=False,
                 )
                 results_for_csv.append({'Ticker': ticker_name, 'RecentStrongBuyStreakDays': streak_days})
 
                 print(f"--- 完成处理 Ticker: {ticker_name} ---")
         
-        print("\\n所有股票处理完毕。")
+        print("\n所有股票处理完毕。")
         save_summary_data_to_csv(results_for_csv, current_save_path, summary_filename)
 
     except KeyboardInterrupt:
-        print("\\n脚本被用户中断。正在保存已收集的数据...")
+        print("\n脚本被用户中断。正在保存已收集的数据...")
         save_summary_data_to_csv(results_for_csv, current_save_path, summary_filename) 
     
     except Exception as e:
-        print(f"\\n处理过程中发生意外错误: {e}")
+        print(f"\n处理过程中发生意外错误: {e}")
         print("正在尝试保存已收集的数据...")
         save_summary_data_to_csv(results_for_csv, current_save_path, summary_filename) 
 
     finally:
         if driver:
-            print("\\n脚本执行完毕或被中断。浏览器状态由用户控制。")
+            print("\n脚本执行完毕或被中断。浏览器状态由用户控制。")
             pass 
 
 
