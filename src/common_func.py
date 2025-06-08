@@ -4,7 +4,7 @@
 文件名: parse_picker_rating.py
 功能描述: 
     本模块负责获取并分析 SeekingAlpha 网站上特定股票的 Quant Ratings 历史数据。
-    作为 parse_my_alpha_picker.py 的辅助模块使用。
+    作为 parse_top_quant.py 的辅助模块使用。
 
 主要功能:
     1. connect_and_parse_ticker_rating: 
@@ -20,7 +20,7 @@
        
 使用方式:
     1. 可作为独立脚本运行，用于测试单个股票的评级分析
-    2. 可被 parse_my_alpha_picker.py 导入并调用其功能
+    2. 可被 parse_top_quant.py 导入并调用其功能
     
 注意事项:
     - 脚本通过 debuggerAddress 连接到已打开的Chrome浏览器
@@ -41,7 +41,7 @@ from bs4 import BeautifulSoup
 
 
 # 连接到已打开的Chrome浏览器，获取网页内容，可选保存网页。
-def parse_ticker_rating_days(ticker_name, driver=None, b_save_webpage=False, rating_list=["Strong Buy"], save_path="./picker_rating", html_file_name=None, desired_item_count=180):
+def parse_ticker_rating_days(ticker_name, driver=None, b_save_webpage=False, rating_list=["Strong Buy"], save_path="./picker_rating", html_file_name=None, desired_item_count=250):
     """
     连接到已打开的Chrome浏览器，获取网页内容，可选保存网页。
     
@@ -79,7 +79,7 @@ def parse_ticker_rating_days(ticker_name, driver=None, b_save_webpage=False, rat
             print("特定元素 data-test-id='table-body-infinite' 已定位。")
 
             # 循环滚动直到加载足够多的条目
-            max_scroll_attempts = 15  # 最多尝试滚动15次，避免无限循环
+            max_scroll_attempts = 30  # 最多尝试滚动15次，避免无限循环
             scroll_attempt = 0
 
             while scroll_attempt < max_scroll_attempts:
@@ -98,11 +98,11 @@ def parse_ticker_rating_days(ticker_name, driver=None, b_save_webpage=False, rat
                 # 向下滚动页面
                 print("向下滚动页面以加载更多条目...")
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(3)  # 等待3秒让新内容加载
+                time.sleep(0.3)  # 等待0.5秒让新内容加载
 
                 # 检查是否有新的内容加载，或者是否到达页面底部且无法再加载
                 new_items = driver.find_elements(By.CSS_SELECTOR, "tr.wyOal.aq4es.t_YUL.GAfu6")
-                if len(new_items) == current_item_count and scroll_attempt > 5:  # 滚动5次后如果数量不再增加，可能到底了
+                if len(new_items) == current_item_count and scroll_attempt > 10:  # 滚动10次后如果数量不再增加，可能到底了
                     print("滚动后条目数量未增加，可能已到达页面底部。")
                     # break # 可以选择在这里中断，或者继续尝试直到max_scroll_attempts
 

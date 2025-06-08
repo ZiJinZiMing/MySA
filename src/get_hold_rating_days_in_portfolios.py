@@ -66,7 +66,7 @@ def main():
     rating_type = [ "Hold", "Sell", "Strong Sell"]
     output_file = "hold_rating_days.csv"
     save_path = "."
-    exclude_tickers = ["NVDA","MSTR","IBIT","BTC-USD","VOO","TSM"]
+    exclude_tickers = ["NVDA","AVGO","GOOG","TSLA","MSTR","IBIT","BTC-USD","VOO","TSM"]
     
     # 确保保存路径存在
     if not os.path.exists(save_path):
@@ -89,7 +89,7 @@ def main():
         holdings_tickers = connect_parse_portfolio_picker_list(
             holdings_url,
             driver,
-            b_save_webpage_csv=True,
+            b_save_webpage_csv=False,
             save_path=save_path,
         )
 
