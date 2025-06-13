@@ -62,7 +62,8 @@ def create_csv_with_header(filename, rating_type="Hold"):
 def main():
 
     
-    holdings_url = "https://seekingalpha.com/account/portfolio/summary?portfolioId=63326124"
+    # holdings_url = "https://seekingalpha.com/account/portfolio/summary?portfolioId=63326124"
+    holdings_url = "https://seekingalpha.com/account/portfolio/total_view?portfolioId=63326124"
     rating_type = [ "Hold", "Sell", "Strong Sell"]
     output_file = "hold_rating_days.csv"
     save_path = "."

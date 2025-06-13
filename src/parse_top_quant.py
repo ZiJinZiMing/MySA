@@ -32,7 +32,7 @@ import pandas as pd
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
-from common_func import parse_ticker_rating_days, connect_parse_screener_picker_list, connect_parse_portfolio_picker_list
+from common_func import parse_ticker_rating_days, connect_parse_screener_picker_list, connect_parse_portfolio_picker_list, get_ticker_rating_info
 
 
 def save_summary_data_to_csv(data_list, save_path, filename):
@@ -91,7 +91,86 @@ def load_cached_data(save_path, filename):
     return cached_data_dict, cached_data_list
 
 
-if __name__ == "__main__":
+def get_buy_rating_info(ticker_name, driver=None):
+    """
+    获取特定股票的买入评级信息
+    
+    参数:
+        ticker_name (str): 股票代码
+        driver (WebDriver, optional): Selenium WebDriver对象
+        
+    返回:
+        tuple: (recent_strong_buy_days, recent_strong_buy_or_buy_days, effect_days_in_strong_buy_or_buy)
+            - recent_strong_buy_days: 最近连续Strong Buy的天数
+            - recent_strong_buy_or_buy_days: 最近连续Strong Buy或Buy的天数
+            - effect_days_in_strong_buy_or_buy: 在连续Strong Buy或Buy天数期间内Strong Buy的天数
+    """
+    rating_info = get_ticker_rating_info(ticker_name, driver=driver)
+    
+    # 初始化计数器
+    recent_strong_buy_days = 0  # 最近连续StrongBuy的天数
+    recent_buy_days = 0  # 最近连续StrongBuy或Buy的天数
+    # 连续StrongBuy或Buy的天数过程中StrongBuy的天数
+    strong_buy_days_in_recent_buy = 0
+    
+    # 检查是否成功获取评级信息
+    if not rating_info:
+        print(f"未能获取到{ticker_name}的评级信息")
+        return recent_strong_buy_days, recent_buy_days, strong_buy_days_in_recent_buy
+
+    # 从最新日期（列表末尾）开始向前处理
+    for entry in rating_info:
+        rating = entry.get('rating', '').strip()
+
+        # 检查是否为Strong Buy
+        if rating.lower() == 'strong buy':
+            recent_strong_buy_days += 1
+        else:
+            # 遇到非Buy/Strong Buy评级，两个连续计数都中断
+            break
+
+        # 从最新日期（列表末尾）开始向前处理
+    for entry in rating_info:
+        rating = entry.get('rating', '').strip()
+
+        # 检查是否为Strong Buy
+        if rating.lower() == 'strong buy' or rating.lower() == 'buy':
+            recent_buy_days += 1
+            # 检查是否为Buy
+            if rating.lower() == 'strong buy':
+                # Buy符合Strong Buy或Buy的条件
+                strong_buy_days_in_recent_buy += 1
+        else:
+            # 遇到非Buy/Strong Buy评级，两个连续计数都中断
+            break
+
+
+
+    print(f"{ticker_name} 评级分析结果:")
+    print(f"  最近连续Strong Buy天数: {recent_strong_buy_days}")
+    print(f"  最近连续Strong Buy或Buy天数: {recent_buy_days}")
+    print(f"  连续Strong Buy或Buy期间内Strong Buy的天数: {strong_buy_days_in_recent_buy}")
+    
+    return recent_strong_buy_days, recent_buy_days, strong_buy_days_in_recent_buy
+
+
+
+def test_get_buy_rating_info():
+
+    chrome_options = Options()
+    chrome_options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+    print("正在连接到Chrome浏览器以下载picker列表页面...")
+    driver = webdriver.Chrome(options=chrome_options)
+    ticker_name = "STRT"
+
+    result = get_buy_rating_info(ticker_name, driver=driver)
+    print(result)
+
+    return
+
+
+
+def main():
     # picker_list_url = "https://seekingalpha.com/screeners/967f241ea593-MyAlphaPicker"  # MyAlphaPicker列表
     picker_list_url = "https://seekingalpha.com/screeners/967141c6704b-TopQuant"  # TioQuant列表
     current_save_path = "."
@@ -138,19 +217,6 @@ if __name__ == "__main__":
         # 从数据中提取ticker列表
         my_holdings = [stock['ticker'] for stock in my_holdings_data if 'ticker' in stock]
 
-        #
-        # # 保存持仓组合完整数据
-        # if my_holdings_data:
-        #     try:
-        #         holdings_data_filename = "portfolio_holdings_complete_data.csv"
-        #         holdings_df = pd.DataFrame(my_holdings_data)
-        #         holdings_csv_path = os.path.join(current_save_path, holdings_data_filename)
-        #         holdings_df.to_csv(holdings_csv_path, index=False, encoding='utf-8')
-        #         print(f"\n持仓组合完整数据已保存到: {holdings_csv_path}")
-        #     except Exception as e:
-        #         print(f"\n保存持仓组合完整数据时发生错误: {str(e)}")
-        #
-
         # 获取观察列表
         print("获取观察列表...")
         my_watch_list_url = "https://seekingalpha.com/account/portfolio/summary?portfolioId=63351093"
@@ -158,19 +224,6 @@ if __name__ == "__main__":
 
         # 从数据中提取ticker列表
         my_watch_list = [stock['ticker'] for stock in my_watch_list_data if 'ticker' in stock]
-
-        #
-        # # 保存观察列表完整数据
-        # if my_watch_list_data:
-        #     try:
-        #         watchlist_data_filename = "portfolio_watchlist_complete_data.csv"
-        #         watchlist_df = pd.DataFrame(my_watch_list_data)
-        #         watchlist_csv_path = os.path.join(current_save_path, watchlist_data_filename)
-        #         watchlist_df.to_csv(watchlist_csv_path, index=False, encoding='utf-8')
-        #         print(f"\n观察列表完整数据已保存到: {watchlist_csv_path}")
-        #     except Exception as e:
-        #         print(f"\n保存观察列表完整数据时发生错误: {str(e)}")
-
 
         # 从my_alpha_pickers中去掉my_holdings和my_watch_list中的股票
         all_tickers = [ticker for ticker in my_alpha_pickers if ticker not in my_holdings and ticker not in my_watch_list]
@@ -202,25 +255,10 @@ if __name__ == "__main__":
                     time.sleep(long_random_delay)
 
                 print(f"\n--- 开始处理 Ticker ({ticker_processed_count}/{len(tickers_to_process)}): {ticker_name} ---")
-                # ticker_rating_url = f"https://seekingalpha.com/symbol/{ticker_name}/ratings/quant-ratings"
 
-                streak_days = parse_ticker_rating_days(
-                    ticker_name,
-                    save_path=current_save_path,
-                    driver=driver,
-                    b_save_webpage=False,
-                    rating_list=["Strong Buy"],
-                )
+                recent_strong_buy_days, recent_buy_days, strong_buy_days_in_recent_buy = get_buy_rating_info(ticker_name, driver=driver)
 
-                StrongBugOrBuy_days = parse_ticker_rating_days(
-                    ticker_name,
-                    save_path=current_save_path,
-                    driver=driver,
-                    b_save_webpage=False,
-                    rating_list=["Strong Buy", "Buy"],
-                )
-
-                results_for_csv.append({'Ticker': ticker_name, 'RecentStrongBuyStreakDays': streak_days, 'RecentStrongBugOrBuyDays': StrongBugOrBuy_days})
+                results_for_csv.append({'Ticker': ticker_name, 'RecentStrongBuyStreakDays': recent_strong_buy_days, 'RecentBuyDays': recent_buy_days, 'StrongBuyDaysInRecentBuy': strong_buy_days_in_recent_buy})
 
                 print(f"--- 完成处理 Ticker: {ticker_name} ---")
 
@@ -240,3 +278,8 @@ if __name__ == "__main__":
         if driver:
             print("\n脚本执行完毕或被中断。浏览器状态由用户控制。")
             pass
+    return
+
+if __name__ == "__main__":
+    main()
+    # test_get_buy_rating_info()
