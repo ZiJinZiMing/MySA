@@ -64,10 +64,10 @@ def main():
     
     # holdings_url = "https://seekingalpha.com/account/portfolio/summary?portfolioId=63326124"
     holdings_url = "https://seekingalpha.com/account/portfolio/total_view?portfolioId=63326124"
-    rating_type = [ "Hold", "Sell", "Strong Sell"]
+    rating_type = [ "buy", "hold", "sell", "strong sell"]
     output_file = "hold_rating_days.csv"
     save_path = "."
-    exclude_tickers = ["NVDA","AVGO","GOOG","TSLA","MSTR","IBIT","BTC-USD","VOO","TSM"]
+    exclude_tickers = ["NVDA","AVGO","GOOG","TSLA","MSTR","IBIT","BTC-USD","VOO","TSM","AAPL"]
     
     # 确保保存路径存在
     if not os.path.exists(save_path):
@@ -116,8 +116,9 @@ def main():
             if ticker_symbol in exclude_tickers:
                 print(f"跳过排除列表中的股票: {ticker_symbol}")
                 continue
-                
-            if ticker.get('quant_rating', '').lower() == match_rating:
+            tick_rating = ticker.get('quant_rating', '').lower()
+            # 如果tick_rating在rating_type中，则处理
+            if  tick_rating in rating_type:
                 total_matched_stocks += 1
                 days = parse_ticker_rating_days(
                     ticker_symbol,

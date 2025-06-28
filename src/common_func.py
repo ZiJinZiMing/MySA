@@ -137,13 +137,22 @@ def get_ticker_rating_info(ticker_name, driver=None, b_save_webpage=False, save_
         # 开始分析网页内容
         soup = BeautifulSoup(page_source, 'html.parser')
 
+        # 提取交易所信息
+        exchange_info = "Unknown"
+        symbol_desc_div = soup.find('div', attrs={'data-test-id': 'symbol-description'})
+        if symbol_desc_div and hasattr(symbol_desc_div, 'find'):
+            first_span = symbol_desc_div.find('span')
+            if first_span and hasattr(first_span, 'get_text'):
+                exchange_info = first_span.get_text(strip=True).replace(' |', '')
+                print(f"交易所信息: {exchange_info}")
+
         # 定位所有评级条目的表格行
         # 类名来自用户之前提供的HTML片段和脚本中的CSS选择器
         rating_rows = soup.select("tr.wyOal.aq4es.t_YUL.GAfu6")
 
         if not rating_rows:
             print("在HTML中未能找到评级条目。")
-            return 0
+            return {'ratings': [], 'exchange': exchange_info}
 
         ratings_data = []
         for row in rating_rows:
@@ -157,9 +166,9 @@ def get_ticker_rating_info(ticker_name, driver=None, b_save_webpage=False, save_
 
         if not ratings_data:
             print("未能从HTML条目中解析出日期和评级数据。")
-            return 0
+            return {'ratings': [], 'exchange': exchange_info}
 
-        return ratings_data
+        return {'ratings': ratings_data, 'exchange': exchange_info}
 
     except Exception as e:
         print(f"发生错误: {str(e)}")
@@ -181,7 +190,13 @@ def parse_ticker_rating_days(ticker_name, driver=None, b_save_webpage=False, rat
     """
 
     # 使用get_ticker_rating_info函数获取评级数据
-    ratings_data = get_ticker_rating_info(ticker_name, driver, b_save_webpage, save_path, html_file_name, desired_item_count)
+    result = get_ticker_rating_info(ticker_name, driver, b_save_webpage, save_path, html_file_name, desired_item_count)
+    
+    # 从结果中提取评级数据和交易所信息
+    ratings_data = result.get('ratings', [])
+    exchange_info = result.get('exchange', 'Unknown')
+    
+    print(f"股票 {ticker_name} 交易所信息: {exchange_info}")
 
     # 如果获取数据失败或为空，返回错误码
     if not ratings_data:
@@ -559,6 +574,27 @@ def connect_parse_portfolio_picker_list(url, driver, b_save_webpage_csv=False, s
                 stock_data['sell_side_rating'] = 'N/A'
                 stock_data['sell_side_score'] = 'N/A'
 
+            # 提取持仓比例（Weight）
+            try:
+                weight_elem = row.find_element(By.XPATH, ".//div[@data-test-id='portfolio-ticker-price-weight']/span")
+                stock_data['weight'] = weight_elem.text.strip()
+            except Exception as e:
+                stock_data['weight'] = 'N/A'
+
+            # 提取24个月Beta（24M Beta）
+            try:
+                beta_elem = row.find_element(By.XPATH, ".//div[@data-test-id='portfolio-ticker-price-beta24m']/span")
+                stock_data['beta_24m'] = beta_elem.text.strip()
+            except Exception as e:
+                stock_data['beta_24m'] = 'N/A'
+
+            # 提取RSI
+            try:
+                rsi_elem = row.find_element(By.XPATH, ".//div[@data-test-id='portfolio-ticker-price-rsi']/span")
+                stock_data['rsi'] = rsi_elem.text.strip()
+            except Exception as e:
+                stock_data['rsi'] = 'N/A'
+
             stocks_data.append(stock_data)
 
         if not stocks_data:
@@ -597,7 +633,8 @@ def connect_parse_portfolio_picker_list(url, driver, b_save_webpage_csv=False, s
                     'ticker',
                     'quant_rating', 'quant_score',
                     'author_rating', 'author_score',
-                    'sell_side_rating', 'sell_side_score'
+                    'sell_side_rating', 'sell_side_score',
+                    'weight', 'beta_24m', 'rsi'
                 ]
 
                 for col in required_columns:
@@ -625,8 +662,8 @@ def connect_parse_portfolio_picker_list(url, driver, b_save_webpage_csv=False, s
 
 
 def main():
-    ticker_name = "WFC"
-    # ticker_name = "BAP"
+    # ticker_name = "WFC"
+    ticker_name = "HDLMY"
 
     chrome_options = Options()
     chrome_options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
@@ -641,15 +678,16 @@ def main():
     # print(pickers)
 
     #
-    # # url = "https://seekingalpha.com/symbol/WFC/ratings/quant-ratings"
-    # pickers = get_ticker_rating_info(ticker_name, driver=driver)
-    # print(pickers)
+    # url = "https://seekingalpha.com/symbol/WFC/ratings/quant-ratings"
+    result = get_ticker_rating_info(ticker_name, driver=driver, b_save_webpage=True)
+    print(f"评级数据: {result['ratings']}")
+    print(f"交易所信息: {result['exchange']}")
     #
-
-    holdings_url = "https://seekingalpha.com/account/portfolio/total_view?portfolioId=63326124"
-
-    connect_parse_portfolio_picker_list(holdings_url,driver,True)
-
+    #
+    # holdings_url = "https://seekingalpha.com/account/portfolio/total_view?portfolioId=63326124"
+    #
+    # connect_parse_portfolio_picker_list(holdings_url,driver,True)
+    #
 
 
 

@@ -32,7 +32,7 @@ import pandas as pd
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
-from common_func import parse_ticker_rating_days, connect_parse_screener_picker_list, connect_parse_portfolio_picker_list, get_ticker_rating_info
+from common_func import connect_parse_screener_picker_list, connect_parse_portfolio_picker_list, get_ticker_rating_info
 
 
 def save_summary_data_to_csv(data_list, save_path, filename):
@@ -105,8 +105,10 @@ def get_buy_rating_info(ticker_name, driver=None):
             - recent_strong_buy_or_buy_days: 最近连续Strong Buy或Buy的天数
             - effect_days_in_strong_buy_or_buy: 在连续Strong Buy或Buy天数期间内Strong Buy的天数
     """
-    rating_info = get_ticker_rating_info(ticker_name, driver=driver)
-    
+    result  = get_ticker_rating_info(ticker_name, driver=driver)
+    rating_info = result['ratings']
+    exchange = result['exchange']
+
     # 初始化计数器
     recent_strong_buy_days = 0  # 最近连续StrongBuy的天数
     recent_buy_days = 0  # 最近连续StrongBuy或Buy的天数
@@ -151,7 +153,7 @@ def get_buy_rating_info(ticker_name, driver=None):
     print(f"  最近连续Strong Buy或Buy天数: {recent_buy_days}")
     print(f"  连续Strong Buy或Buy期间内Strong Buy的天数: {strong_buy_days_in_recent_buy}")
     
-    return recent_strong_buy_days, recent_buy_days, strong_buy_days_in_recent_buy
+    return recent_strong_buy_days, recent_buy_days, strong_buy_days_in_recent_buy, exchange
 
 
 
@@ -183,7 +185,7 @@ def main():
     driver = None
     ticker_processed_count = 0  # 初始化已处理ticker的计数器
     long_delay_interval = 10  # 每处理10个ticker后执行长延时
-    long_delay_interval_2 = 40  # 每处理10个ticker后执行长延时
+    long_delay_interval_2 = 40  # 每处理40个ticker后执行长延时
 
     try:
         chrome_options = Options()
@@ -225,8 +227,17 @@ def main():
         # 从数据中提取ticker列表
         my_watch_list = [stock['ticker'] for stock in my_watch_list_data if 'ticker' in stock]
 
-        # 从my_alpha_pickers中去掉my_holdings和my_watch_list中的股票
-        all_tickers = [ticker for ticker in my_alpha_pickers if ticker not in my_holdings and ticker not in my_watch_list]
+        # TopQuant列表
+        print("获取TopQuant列表...")
+        my_top_quant_url = "https://seekingalpha.com/account/portfolio/summary?portfolioId=64122053"
+        my_top_quant_data = connect_parse_portfolio_picker_list(my_top_quant_url, driver)
+
+        # 从数据中提取ticker列表
+        my_top_quant_list = [stock['ticker'] for stock in my_top_quant_data if 'ticker' in stock]
+
+
+        # 从my_alpha_pickers中去掉my_holdings/my_watch_list/my_top_quant_list中的股票
+        all_tickers = [ticker for ticker in my_alpha_pickers if ticker not in my_holdings and ticker not in my_watch_list and ticker not in my_top_quant_list]
 
         # 过滤掉已经在缓存中的股票
         tickers_to_process = [ticker for ticker in all_tickers if ticker not in cached_ticker_data]
@@ -256,9 +267,9 @@ def main():
 
                 print(f"\n--- 开始处理 Ticker ({ticker_processed_count}/{len(tickers_to_process)}): {ticker_name} ---")
 
-                recent_strong_buy_days, recent_buy_days, strong_buy_days_in_recent_buy = get_buy_rating_info(ticker_name, driver=driver)
+                recent_strong_buy_days, recent_buy_days, strong_buy_days_in_recent_buy,exchange = get_buy_rating_info(ticker_name, driver=driver)
 
-                results_for_csv.append({'Ticker': ticker_name, 'RecentStrongBuyStreakDays': recent_strong_buy_days, 'RecentBuyDays': recent_buy_days, 'StrongBuyDaysInRecentBuy': strong_buy_days_in_recent_buy})
+                results_for_csv.append({'Ticker': ticker_name, 'RecentStrongBuyStreakDays': recent_strong_buy_days, 'RecentBuyDays': recent_buy_days, 'StrongBuyDaysInRecentBuy': strong_buy_days_in_recent_buy, 'exchange': exchange})
 
                 print(f"--- 完成处理 Ticker: {ticker_name} ---")
 
