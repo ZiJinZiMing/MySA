@@ -226,7 +226,10 @@ def parse_ticker_rating_days(ticker_name, driver=None, b_save_webpage=False, rat
 def connect_parse_screener_picker_list(url, driver, b_save_webpage_csv=False, save_path=".", html_file_name=None):
     """
     连接到已打开的Chrome浏览器，下载 MyAlphaPicker 列表网页，确保滚动到底部并等待。
-    现在返回包含ticker_name和三种评级信息的完整股票数据。
+    现在返回包含ticker_name和完整股票信息的数据，包括：
+    - 基本信息：ticker, company_name, price, change_percent, prev_close
+    - 市场信息：market_cap, sector_industry
+    - 评级信息：quant_rating, author_rating, sell_side_rating 及其对应分数
     """
 
     try:
@@ -306,11 +309,72 @@ def connect_parse_screener_picker_list(url, driver, b_save_webpage_csv=False, sa
                 ticker = inner_span.text.strip()
                 if ticker:
                     stock_data['ticker'] = ticker
-                    print(f"找到股票: {ticker}")
+                    print(f"正在处理股票: {ticker}")
 
                     # 获取包含此ticker的行
                     try:
                         row = ticker_element.find_element(By.XPATH, "./ancestor::tr")
+
+                        # 获取公司名称
+                        try:
+                            # 查找公司名称，通常在ticker旁边
+                            company_name_element = row.find_element(By.XPATH, ".//span[@data-test-id='top-rated-ticker-name']/following-sibling::span[1]")
+                            stock_data['company_name'] = company_name_element.text.strip()
+                        except Exception as e:
+                            # 备用方案：查找包含公司名称的其他元素
+                            try:
+                                company_name_element = row.find_element(By.XPATH, ".//td[2]//span[not(@data-test-id)]")
+                                stock_data['company_name'] = company_name_element.text.strip()
+                            except:
+                                stock_data['company_name'] = 'N/A'
+
+                        # 获取价格信息
+                        try:
+                            # 查找价格列，通常在第3列
+                            price_elements = row.find_elements(By.XPATH, ".//td[3]//span")
+                            if price_elements:
+                                # 第一个span通常是当前价格
+                                stock_data['price'] = price_elements[0].text.strip()
+                                # 第二个span可能是前收盘价
+                                if len(price_elements) > 1:
+                                    prev_close_text = price_elements[1].text.strip()
+                                    # 提取前收盘价数值（去除"Post."等前缀）
+                                    if "Post." in prev_close_text:
+                                        stock_data['prev_close'] = prev_close_text.replace("Post.", "").strip()
+                                    else:
+                                        stock_data['prev_close'] = prev_close_text
+                                else:
+                                    stock_data['prev_close'] = 'N/A'
+                            else:
+                                stock_data['price'] = 'N/A'
+                                stock_data['prev_close'] = 'N/A'
+                        except Exception as e:
+                            stock_data['price'] = 'N/A'
+                            stock_data['prev_close'] = 'N/A'
+
+                        # 获取变化百分比
+                        try:
+                            # 查找变化百分比，通常在第4列
+                            change_element = row.find_element(By.XPATH, ".//td[4]//span")
+                            stock_data['change_percent'] = change_element.text.strip()
+                        except Exception as e:
+                            stock_data['change_percent'] = 'N/A'
+
+                        # 获取市值 (Market Cap)
+                        try:
+                            # 查找市值列，通常在第6列或第7列
+                            market_cap_element = row.find_element(By.XPATH, ".//td[6]//span | .//td[7]//span[contains(text(), 'B') or contains(text(), 'M') or contains(text(), 'K')]")
+                            stock_data['market_cap'] = market_cap_element.text.strip()
+                        except Exception as e:
+                            stock_data['market_cap'] = 'N/A'
+
+                        # 获取行业信息 (Sector & Industry)
+                        try:
+                            # 查找行业列，通常在第7列或第8列
+                            sector_element = row.find_element(By.XPATH, ".//td[7]//span[not(contains(text(), 'B')) and not(contains(text(), 'M')) and not(contains(text(), 'K'))] | .//td[8]//span")
+                            stock_data['sector_industry'] = sector_element.text.strip()
+                        except Exception as e:
+                            stock_data['sector_industry'] = 'N/A'
 
                         # 在同一行中查找评级信息
                         try:
@@ -379,7 +443,13 @@ def connect_parse_screener_picker_list(url, driver, b_save_webpage_csv=False, sa
                             stock_data['sell_side_rating'] = 'N/A'
                             stock_data['sell_side_score'] = 'N/A'
                     except Exception as e:
-                        # 若无法找到行或评级，设置为N/A
+                        # 若无法找到行或其他信息，设置为N/A
+                        stock_data['company_name'] = 'N/A'
+                        stock_data['price'] = 'N/A'
+                        stock_data['change_percent'] = 'N/A'
+                        stock_data['market_cap'] = 'N/A'
+                        stock_data['sector_industry'] = 'N/A'
+                        stock_data['prev_close'] = 'N/A'
                         stock_data['quant_rating'] = 'N/A'
                         stock_data['quant_score'] = 'N/A'
                         stock_data['author_rating'] = 'N/A'
@@ -395,20 +465,22 @@ def connect_parse_screener_picker_list(url, driver, b_save_webpage_csv=False, sa
 
         print(f"\n总共提取到 {len(stocks_data)} 个股票数据")
 
-        # 显示前5个股票的详细信息
-        for i, stock in enumerate(stocks_data[:5]):
+        # 显示前3个股票的详细信息
+        for i, stock in enumerate(stocks_data[:3]):
             ticker = stock.get('ticker', 'N/A')
+            company_name = stock.get('company_name', 'N/A')
+            price = stock.get('price', 'N/A')
+            change_percent = stock.get('change_percent', 'N/A')
+            market_cap = stock.get('market_cap', 'N/A')
+            sector_industry = stock.get('sector_industry', 'N/A')
+            prev_close = stock.get('prev_close', 'N/A')
             quant_rating = stock.get('quant_rating', 'N/A')
             quant_score = stock.get('quant_score', 'N/A')
-            author_rating = stock.get('author_rating', 'N/A')
-            author_score = stock.get('author_score', 'N/A')
-            sell_side_rating = stock.get('sell_side_rating', 'N/A')
-            sell_side_score = stock.get('sell_side_score', 'N/A')
 
-            print(f"股票 {i + 1}: {ticker}")
-            print(f"  Quant Rating: {quant_rating}, Score: {quant_score}")
-            print(f"  Author Rating: {author_rating}, Score: {author_score}")
-            print(f"  Sell-Side Rating: {sell_side_rating}, Score: {sell_side_score}")
+            print(f"股票 {i + 1}: {ticker} - {company_name}")
+            print(f"  价格: {price}, 变化: {change_percent}, 前收盘: {prev_close}")
+            print(f"  市值: {market_cap}, 行业: {sector_industry}")
+            print(f"  Quant评级: {quant_rating} ({quant_score})")
 
         if b_save_webpage_csv:
             try:
@@ -417,9 +489,10 @@ def connect_parse_screener_picker_list(url, driver, b_save_webpage_csv=False, sa
                 csv_filename = f"{base_name}_data.csv"
                 csv_full_path = os.path.join(save_path, csv_filename)
 
-                # 确保所有列都存在，即使某些股票可能没有这些评级
+                # 确保所有列都存在，即使某些股票可能没有这些信息
                 required_columns = [
-                    'ticker',
+                    'ticker', 'company_name', 'price', 'change_percent', 'prev_close',
+                    'market_cap', 'sector_industry',
                     'quant_rating', 'quant_score',
                     'author_rating', 'author_score',
                     'sell_side_rating', 'sell_side_score'
@@ -429,7 +502,7 @@ def connect_parse_screener_picker_list(url, driver, b_save_webpage_csv=False, sa
                     if col not in df.columns:
                         df[col] = 'N/A'  # 添加缺失的列
 
-                # 重新排序列，使ticker列在最前面，然后是各种评级
+                # 重新排序列，使核心信息在前面
                 columns_order = [col for col in required_columns if col in df.columns]
                 other_columns = [col for col in df.columns if col not in required_columns]
                 df = df[columns_order + other_columns]
@@ -574,12 +647,33 @@ def connect_parse_portfolio_picker_list(url, driver, b_save_webpage_csv=False, s
                 stock_data['sell_side_rating'] = 'N/A'
                 stock_data['sell_side_score'] = 'N/A'
 
+            # 提取价格信息（Price）
+            try:
+                price_elem = row.find_element(By.XPATH, ".//div[@data-test-id='portfolio-ticker-price-price']/span")
+                stock_data['price'] = price_elem.text.strip()
+            except Exception as e:
+                stock_data['price'] = 'N/A'
+
+            # 提取股数信息（Shares）
+            try:
+                shares_elem = row.find_element(By.XPATH, ".//span[@data-test-id='share-value']")
+                stock_data['shares'] = shares_elem.text.strip()
+            except Exception as e:
+                stock_data['shares'] = 'N/A'
+
             # 提取持仓比例（Weight）
             try:
                 weight_elem = row.find_element(By.XPATH, ".//div[@data-test-id='portfolio-ticker-price-weight']/span")
                 stock_data['weight'] = weight_elem.text.strip()
             except Exception as e:
                 stock_data['weight'] = 'N/A'
+
+            # 提取持仓价值（Value）
+            try:
+                value_elem = row.find_element(By.XPATH, ".//div[@data-test-id='portfolio-ticker-price-value']/span")
+                stock_data['value'] = value_elem.text.strip()
+            except Exception as e:
+                stock_data['value'] = 'N/A'
 
             # 提取24个月Beta（24M Beta）
             try:

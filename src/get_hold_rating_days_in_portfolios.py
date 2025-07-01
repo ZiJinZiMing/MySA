@@ -90,7 +90,7 @@ def main():
         holdings_tickers = connect_parse_portfolio_picker_list(
             holdings_url,
             driver,
-            b_save_webpage_csv=False,
+            b_save_webpage_csv=True,
             save_path=save_path,
         )
 
@@ -144,14 +144,21 @@ def main():
             # 创建一个新的CSV文件，包含更多详细信息
             detailed_csv_filename = os.path.join(save_path, f"{match_rating}_detailed.csv")
             
-            # 确定所有可能的列
+            # 定义期望的列顺序，优先显示重要信息
+            priority_columns = [
+                'ticker', 'rating_days', 'quant_rating', 'quant_score',
+                'author_rating', 'author_score', 'sell_side_rating', 'sell_side_score',
+                'weight', 'beta_24m', 'rsi'
+            ]
+            
+            # 获取所有实际存在的列
             all_columns = set()
             for stock in processed_stocks:
                 all_columns.update(stock.keys())
             
-            # 排序列名，使ticker和rating_days出现在前面
-            columns = ['ticker', 'rating_days']
-            columns.extend([col for col in sorted(all_columns) if col not in columns])
+            # 构建最终的列顺序：优先列 + 其他列
+            columns = [col for col in priority_columns if col in all_columns]
+            columns.extend([col for col in sorted(all_columns) if col not in priority_columns])
             
             # 写入CSV文件
             with open(detailed_csv_filename, 'w', newline='', encoding='utf-8') as f:
@@ -161,6 +168,38 @@ def main():
                     writer.writerow(stock)
             
             print(f"详细结果已保存到: {detailed_csv_filename}")
+            
+            # 显示统计摘要
+            print(f"\n📊 {match_rating}评级股票统计摘要:")
+            
+            # 评级天数统计
+            rating_days_list = [stock.get('rating_days', 0) for stock in processed_stocks if isinstance(stock.get('rating_days'), (int, float)) and stock.get('rating_days') > 0]
+            if rating_days_list:
+                print(f"  评级天数统计:")
+                print(f"    - 平均天数: {sum(rating_days_list)/len(rating_days_list):.1f}")
+                print(f"    - 最长天数: {max(rating_days_list)}")
+                print(f"    - 最短天数: {min(rating_days_list)}")
+            
+            # 权重统计
+            weights = [stock.get('weight', '0%') for stock in processed_stocks if stock.get('weight', 'N/A') != 'N/A']
+            if weights:
+                try:
+                    weight_values = [float(w.replace('%', '')) for w in weights if '%' in w]
+                    if weight_values:
+                        print(f"  持仓权重统计:")
+                        print(f"    - 总权重: {sum(weight_values):.2f}%")
+                        print(f"    - 平均权重: {sum(weight_values)/len(weight_values):.2f}%")
+                except:
+                    pass
+            
+            # 显示前5名高评级天数的股票
+            top_stocks = sorted(processed_stocks, key=lambda x: x.get('rating_days', 0) if isinstance(x.get('rating_days'), (int, float)) else 0, reverse=True)[:5]
+            if top_stocks:
+                print(f"\n🏆 {match_rating}评级天数最长的前5支股票:")
+                for i, stock in enumerate(top_stocks):
+                    days = stock.get('rating_days', 'N/A')
+                    weight = stock.get('weight', 'N/A')
+                    print(f"  {i+1}. {stock['ticker']}: {days}天 (权重: {weight})")
         else:
             print(f"\n未能处理任何{match_rating}评级股票")
 

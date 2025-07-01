@@ -118,7 +118,7 @@ def get_buy_rating_info(ticker_name, driver=None):
     # 检查是否成功获取评级信息
     if not rating_info:
         print(f"未能获取到{ticker_name}的评级信息")
-        return recent_strong_buy_days, recent_buy_days, strong_buy_days_in_recent_buy
+        return recent_strong_buy_days, recent_buy_days, strong_buy_days_in_recent_buy, exchange
 
     # 从最新日期（列表末尾）开始向前处理
     for entry in rating_info:
@@ -197,99 +197,146 @@ def main():
         print("获取MyAlphaPicker列表...")
         my_alpha_picker_data = connect_parse_screener_picker_list(picker_list_url, driver, b_save_webpage_csv=False)
 
-        # 从数据中提取ticker列表
-        my_alpha_pickers = [stock['ticker'] for stock in my_alpha_picker_data if 'ticker' in stock]
+        # 从数据中提取ticker列表和基本信息
+        if not my_alpha_picker_data:
+            print("未能获取到MyAlphaPicker数据")
+            return
 
-        # 保存完整的股票数据，包括评级信息
-        if my_alpha_picker_data:
+        print(f"\\n获取到 {len(my_alpha_picker_data)} 个股票的基本信息")
+
+        # 遍历每个ticker并分析其评级历史
+        for stock_info in my_alpha_picker_data:
+            ticker = stock_info.get('ticker', '')
+            if not ticker:
+                continue
+
+            # 检查是否已经在缓存中
+            if ticker in cached_ticker_data:
+                print(f"\\n跳过已缓存的ticker: {ticker} (连续Strong Buy天数: {cached_ticker_data[ticker]})")
+                continue
+
+            print(f"\\n正在分析 {ticker} 的评级历史...")
+
+            # 随机延时
+            delay = random.uniform(1, 3)
+            print(f"等待 {delay:.1f} 秒...")
+            time.sleep(delay)
+
             try:
-                complete_data_filename = "alpha_picker_complete_data.csv"
-                complete_df = pd.DataFrame(my_alpha_picker_data)
-                complete_csv_path = os.path.join(current_save_path, complete_data_filename)
-                complete_df.to_csv(complete_csv_path, index=False, encoding='utf-8')
-                print(f"\n完整股票数据（含评级信息）已保存到: {complete_csv_path}")
+                # 获取买入评级信息
+                recent_strong_buy_days, recent_buy_days, strong_buy_days_in_recent_buy, exchange = get_buy_rating_info(ticker, driver)
+
+                # 创建综合结果记录
+                result_record = {
+                    'Ticker': ticker,
+                    'CompanyName': stock_info.get('company_name', 'N/A'),
+                    'Price': stock_info.get('price', 'N/A'),
+                    'ChangePercent': stock_info.get('change_percent', 'N/A'),
+                    'PrevClose': stock_info.get('prev_close', 'N/A'),
+                    'MarketCap': stock_info.get('market_cap', 'N/A'),
+                    'SectorIndustry': stock_info.get('sector_industry', 'N/A'),
+                    'Exchange': exchange,
+                    'QuantRating': stock_info.get('quant_rating', 'N/A'),
+                    'QuantScore': stock_info.get('quant_score', 'N/A'),
+                    'AuthorRating': stock_info.get('author_rating', 'N/A'),
+                    'AuthorScore': stock_info.get('author_score', 'N/A'),
+                    'SellSideRating': stock_info.get('sell_side_rating', 'N/A'),
+                    'SellSideScore': stock_info.get('sell_side_score', 'N/A'),
+                    'RecentStrongBuyStreakDays': recent_strong_buy_days,
+                    'RecentBuyStreakDays': recent_buy_days,
+                    'StrongBuyDaysInBuyStreak': strong_buy_days_in_recent_buy,
+                }
+
+                results_for_csv.append(result_record)
+                ticker_processed_count += 1
+
+                print(f"已处理 {ticker_processed_count} 个ticker")
+
+                # 每处理一定数量的ticker后保存一次数据
+                if ticker_processed_count % 5 == 0:
+                    save_summary_data_to_csv(results_for_csv, current_save_path, summary_filename)
+                    print(f"\\n已保存进度 (处理了 {ticker_processed_count} 个ticker)")
+
+                # 长延时机制
+                if ticker_processed_count % long_delay_interval == 0:
+                    long_delay = random.uniform(5, 10)
+                    print(f"\\n每 {long_delay_interval} 个ticker执行长延时 {long_delay:.1f} 秒...")
+                    time.sleep(long_delay)
+
+                if ticker_processed_count % long_delay_interval_2 == 0:
+                    very_long_delay = random.uniform(20, 30)
+                    print(f"\\n每 {long_delay_interval_2} 个ticker执行超长延时 {very_long_delay:.1f} 秒...")
+                    time.sleep(very_long_delay)
+
+            except KeyboardInterrupt:
+                print(f"\\n用户中断，已处理 {ticker_processed_count} 个ticker")
+                break
+
             except Exception as e:
-                print(f"\n保存完整股票数据时发生错误: {str(e)}")
+                print(f"\\n处理 {ticker} 时发生错误: {str(e)}")
+                # 即使发生错误，也要记录基本信息
+                result_record = {
+                    'Ticker': ticker,
+                    'CompanyName': stock_info.get('company_name', 'N/A'),
+                    'Price': stock_info.get('price', 'N/A'),
+                    'ChangePercent': stock_info.get('change_percent', 'N/A'),
+                    'PrevClose': stock_info.get('prev_close', 'N/A'),
+                    'MarketCap': stock_info.get('market_cap', 'N/A'),
+                    'SectorIndustry': stock_info.get('sector_industry', 'N/A'),
+                    'Exchange': 'Error',
+                    'QuantRating': stock_info.get('quant_rating', 'N/A'),
+                    'QuantScore': stock_info.get('quant_score', 'N/A'),
+                    'AuthorRating': stock_info.get('author_rating', 'N/A'),
+                    'AuthorScore': stock_info.get('author_score', 'N/A'),
+                    'SellSideRating': stock_info.get('sell_side_rating', 'N/A'),
+                    'SellSideScore': stock_info.get('sell_side_score', 'N/A'),
+                    'RecentStrongBuyStreakDays': -1,  # 错误标记
+                    'RecentBuyStreakDays': -1,
+                    'StrongBuyDaysInBuyStreak': -1,
+                }
+                results_for_csv.append(result_record)
+                ticker_processed_count += 1
 
-        # 获取投资组合
-        print("获取持仓组合...")
-        my_holdings_url = "https://seekingalpha.com/account/portfolio/summary?portfolioId=63326124"
-        my_holdings_data = connect_parse_portfolio_picker_list(my_holdings_url, driver, b_save_webpage_csv=False)
-
-        # 从数据中提取ticker列表
-        my_holdings = [stock['ticker'] for stock in my_holdings_data if 'ticker' in stock]
-
-        # 获取观察列表
-        print("获取观察列表...")
-        my_watch_list_url = "https://seekingalpha.com/account/portfolio/summary?portfolioId=63351093"
-        my_watch_list_data = connect_parse_portfolio_picker_list(my_watch_list_url, driver)
-
-        # 从数据中提取ticker列表
-        my_watch_list = [stock['ticker'] for stock in my_watch_list_data if 'ticker' in stock]
-
-        # TopQuant列表
-        print("获取TopQuant列表...")
-        my_top_quant_url = "https://seekingalpha.com/account/portfolio/summary?portfolioId=64122053"
-        my_top_quant_data = connect_parse_portfolio_picker_list(my_top_quant_url, driver)
-
-        # 从数据中提取ticker列表
-        my_top_quant_list = [stock['ticker'] for stock in my_top_quant_data if 'ticker' in stock]
-
-
-        # 从my_alpha_pickers中去掉my_holdings/my_watch_list/my_top_quant_list中的股票
-        all_tickers = [ticker for ticker in my_alpha_pickers if ticker not in my_holdings and ticker not in my_watch_list and ticker not in my_top_quant_list]
-
-        # 过滤掉已经在缓存中的股票
-        tickers_to_process = [ticker for ticker in all_tickers if ticker not in cached_ticker_data]
-
-        print(f"\n总共有 {len(all_tickers)} 个股票需要分析")
-        print(f"缓存中已有 {len(cached_ticker_data)} 个股票的数据")
-        print(f"\n将为以下 {len(tickers_to_process)} 个未缓存的股票代码分析 Quant Ratings: {tickers_to_process}")
-
-        if not tickers_to_process:
-            print("所有股票已存在于缓存中，无需重新查询。")
-        else:
-            print(f"\n将为以下股票代码分析 Quant Ratings: {len(tickers_to_process)}个 - {tickers_to_process}")
-
-            for ticker_name in tickers_to_process:
-                ticker_processed_count += 1  # 递增计数器
-
-                # 每处理一定数量的ticker后，执行一次较长的随机延时
-                if ticker_processed_count % long_delay_interval == 0 and ticker_processed_count > 0:
-                    long_random_delay = random.uniform(10, 30)  # 10到30秒的长延时
-                    print(f"\n已处理 {ticker_processed_count} 个ticker，执行额外长延时 {long_random_delay:.2f} 秒...")
-                    time.sleep(long_random_delay)
-
-                if ticker_processed_count % long_delay_interval_2 == 0 and ticker_processed_count > 0:
-                    long_random_delay = random.uniform(60, 180)  # 60到180秒的长延时
-                    print(f"\n已处理 {ticker_processed_count} 个ticker，执行额外长延时 {long_random_delay:.2f} 秒...")
-                    time.sleep(long_random_delay)
-
-                print(f"\n--- 开始处理 Ticker ({ticker_processed_count}/{len(tickers_to_process)}): {ticker_name} ---")
-
-                recent_strong_buy_days, recent_buy_days, strong_buy_days_in_recent_buy,exchange = get_buy_rating_info(ticker_name, driver=driver)
-
-                results_for_csv.append({'Ticker': ticker_name, 'RecentStrongBuyStreakDays': recent_strong_buy_days, 'RecentBuyDays': recent_buy_days, 'StrongBuyDaysInRecentBuy': strong_buy_days_in_recent_buy, 'exchange': exchange})
-
-                print(f"--- 完成处理 Ticker: {ticker_name} ---")
-
-        print("\n所有股票处理完毕。")
+        # 最终保存所有结果
         save_summary_data_to_csv(results_for_csv, current_save_path, summary_filename)
+
+        print(f"\\n\\n=== 分析完成 ===")
+        print(f"总共分析了 {ticker_processed_count} 个股票")
+        print(f"结果已保存到: {os.path.join(current_save_path, summary_filename)}")
+
+        # 显示统计信息
+        if results_for_csv:
+            strong_buy_stocks = [r for r in results_for_csv if r.get('RecentStrongBuyStreakDays', 0) > 0]
+            buy_stocks = [r for r in results_for_csv if r.get('RecentBuyStreakDays', 0) > 0]
+            
+            print(f"\\n=== 统计信息 ===")
+            print(f"有连续Strong Buy评级的股票数量: {len(strong_buy_stocks)}")
+            print(f"有连续Buy评级的股票数量: {len(buy_stocks)}")
+            
+            if strong_buy_stocks:
+                print(f"\\n连续Strong Buy天数最多的前5支股票:")
+                strong_buy_sorted = sorted(strong_buy_stocks, key=lambda x: x.get('RecentStrongBuyStreakDays', 0), reverse=True)
+                for i, stock in enumerate(strong_buy_sorted[:5]):
+                    print(f"  {i+1}. {stock['Ticker']} ({stock.get('CompanyName', 'N/A')}): {stock['RecentStrongBuyStreakDays']}天")
+                    print(f"     行业: {stock.get('SectorIndustry', 'N/A')}, 市值: {stock.get('MarketCap', 'N/A')}")
 
     except KeyboardInterrupt:
-        print("\n脚本被用户中断。正在保存已收集的数据...")
-        save_summary_data_to_csv(results_for_csv, current_save_path, summary_filename)
+        print("\\n程序被用户中断")
+        if results_for_csv:
+            save_summary_data_to_csv(results_for_csv, current_save_path, summary_filename)
+            print(f"已保存当前进度到: {os.path.join(current_save_path, summary_filename)}")
 
     except Exception as e:
-        print(f"\n处理过程中发生意外错误: {e}")
-        print("正在尝试保存已收集的数据...")
-        save_summary_data_to_csv(results_for_csv, current_save_path, summary_filename)
+        print(f"\\n处理过程中发生意外错误: {e}")
+        import traceback
+        traceback.print_exc()
+        if results_for_csv:
+            save_summary_data_to_csv(results_for_csv, current_save_path, summary_filename)
+            print(f"已保存当前进度到: {os.path.join(current_save_path, summary_filename)}")
 
     finally:
         if driver:
-            print("\n脚本执行完毕或被中断。浏览器状态由用户控制。")
-            pass
-    return
+            print("\\n脚本执行完毕。浏览器保持打开状态。")
 
 if __name__ == "__main__":
     main()
