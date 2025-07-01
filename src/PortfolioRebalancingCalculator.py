@@ -10,6 +10,8 @@ import numpy as np
 import re
 import time
 import json
+import os
+from typing import Dict
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -357,6 +359,377 @@ class FixedSeekingAlphaScraper:
         except Exception as e:
             logger.error(f"保存调试信息失败: {e}")
 
+    def parse_local_html_file(self, html_file_path):
+        """
+        解析本地HTML文件获取投资组合数据
+        
+        Args:
+            html_file_path: 本地HTML文件路径
+            
+        Returns:
+            投资组合数据DataFrame
+        """
+        try:
+            logger.info(f"开始解析本地HTML文件: {html_file_path}")
+            
+            # 检查文件是否存在
+            if not os.path.exists(html_file_path):
+                logger.error(f"文件不存在: {html_file_path}")
+                return None
+                
+            # 读取HTML文件
+            with open(html_file_path, 'r', encoding='utf-8') as f:
+                html_content = f.read()
+                
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # 查找投资组合表格
+            table_body = soup.find('tbody', {'data-test-id': 'table-body'})
+            if not table_body:
+                logger.error("未找到投资组合表格")
+                return None
+                
+            portfolio_data = []
+            
+            # 查找所有股票行
+            stock_rows = table_body.find_all('tr', class_='wyOal')
+            logger.info(f"找到 {len(stock_rows)} 只股票")
+            
+            for row_idx, row in enumerate(stock_rows):
+                try:
+                    stock_data = self._extract_stock_data_from_row(row)
+                    if stock_data:
+                        portfolio_data.append(stock_data)
+                        if self.debug_mode:
+                            logger.debug(f"✓ 提取成功: {stock_data['symbol']} - ${stock_data['price']} × {stock_data['shares']} = ${stock_data['value']:.2f}")
+                except Exception as e:
+                    if self.debug_mode:
+                        logger.debug(f"处理第 {row_idx + 1} 行时出错: {e}")
+                    continue
+                    
+            if not portfolio_data:
+                logger.warning("未能提取到有效的投资组合数据")
+                return None
+                
+            df = pd.DataFrame(portfolio_data)
+            
+            # 数据验证和统计
+            logger.info(f"成功提取 {len(df)} 条投资组合记录")
+            total_value = df['value'].sum()
+            logger.info(f"投资组合总价值: ${total_value:,.2f}")
+            
+            # 重新计算权重（确保一致性）
+            df['calculated_weight'] = df['value'] / total_value
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"解析本地HTML文件失败: {e}")
+            return None
+    
+    def _extract_stock_data_from_row(self, row):
+        """
+        从HTML行中提取股票数据
+        
+        Args:
+            row: BeautifulSoup行元素
+            
+        Returns:
+            股票数据字典或None
+        """
+        try:
+            # 提取股票代码
+            symbol_element = row.find('span', {'data-test-id': 'portfolio-ticker-name'})
+            if not symbol_element:
+                return None
+            symbol = symbol_element.get_text(strip=True)
+            
+            # 检查是否是现金项目
+            if symbol.upper() in ['CASH', 'CURRENCY']:
+                # 对于现金项目，处理方式不同
+                weight_element = row.find('div', {'data-test-id': 'portfolio-ticker-price-weight'})
+                weight = None
+                if weight_element:
+                    weight_text = weight_element.find('span').get_text(strip=True)
+                    if weight_text.endswith('%'):
+                        weight = float(weight_text.replace('%', '')) / 100
+                
+                # 提取现金价值
+                value_element = row.find('div', {'data-test-id': 'portfolio-ticker-price-value'})
+                if not value_element:
+                    return None
+                value_text = value_element.find('span').get_text(strip=True)
+                value = float(value_text.replace(',', ''))
+                
+                return {
+                    'symbol': 'CASH',
+                    'price': 1.0,  # 现金价格固定为1
+                    'shares': value,  # 现金数量等于价值
+                    'weight': weight,
+                    'value': value,
+                    'calculated_value': value
+                }
+            
+            # 提取价格
+            price_element = row.find('div', {'data-test-id': 'portfolio-ticker-price-price'})
+            if not price_element:
+                return None
+            price_text = price_element.find('span').get_text(strip=True)
+            price = float(price_text.replace(',', ''))
+            
+            # 提取股数
+            shares_element = row.find('span', {'data-test-id': 'share-value'})
+            if not shares_element:
+                return None
+            shares_text = shares_element.get_text(strip=True)
+            shares = float(shares_text.replace(',', ''))
+            
+            # 提取权重
+            weight_element = row.find('div', {'data-test-id': 'portfolio-ticker-price-weight'})
+            weight = None
+            if weight_element:
+                weight_text = weight_element.find('span').get_text(strip=True)
+                if weight_text.endswith('%'):
+                    weight = float(weight_text.replace('%', '')) / 100
+            
+            # 提取价值
+            value_element = row.find('div', {'data-test-id': 'portfolio-ticker-price-value'})
+            if not value_element:
+                return None
+            value_text = value_element.find('span').get_text(strip=True)
+            value = float(value_text.replace(',', ''))
+            
+            # 验证数据一致性
+            calculated_value = price * shares
+            if abs(calculated_value - value) > 0.1:  # 允许小幅误差
+                logger.warning(f"{symbol}: 计算价值 {calculated_value:.2f} 与显示价值 {value:.2f} 不一致")
+            
+            return {
+                'symbol': symbol,
+                'price': price,
+                'shares': shares,
+                'weight': weight,
+                'value': value,
+                'calculated_value': calculated_value
+            }
+            
+        except Exception as e:
+            if self.debug_mode:
+                logger.debug(f"提取股票数据失败: {e}")
+            return None
+    
+    def calculate_equal_weight_rebalance(self, portfolio_df, target_cash_percentage=0.0, exclude_symbols=None):
+        """
+        计算等权重再平衡策略
+        
+        Args:
+            portfolio_df: 投资组合DataFrame
+            target_cash_percentage: 目标现金比例 (0.0-1.0)
+            exclude_symbols: 排除的股票代码列表
+            
+        Returns:
+            再平衡指令DataFrame
+        """
+        try:
+            logger.info("开始计算等权重再平衡策略")
+            
+            if portfolio_df is None or portfolio_df.empty:
+                logger.error("投资组合数据为空")
+                return None
+            
+            # 分离现金和股票
+            cash_rows = portfolio_df[portfolio_df['symbol'] == 'CASH']
+            stock_rows = portfolio_df[portfolio_df['symbol'] != 'CASH']
+            
+            # 过滤排除的股票
+            if exclude_symbols:
+                stock_rows = stock_rows[~stock_rows['symbol'].isin(exclude_symbols)]
+                logger.info(f"排除股票: {exclude_symbols}")
+            
+            # 计算总资产价值（包括现金）
+            total_portfolio_value = portfolio_df['value'].sum()
+            available_cash = cash_rows['value'].sum() if not cash_rows.empty else 0
+            stock_value = stock_rows['value'].sum()
+            
+            logger.info(f"投资组合总价值: ${total_portfolio_value:,.2f}")
+            logger.info(f"可用现金: ${available_cash:,.2f}")
+            logger.info(f"股票总价值: ${stock_value:,.2f}")
+            
+            # 计算可投资总金额（总资产减去目标现金保留）
+            target_cash_reserve = total_portfolio_value * target_cash_percentage
+            investable_total = total_portfolio_value - target_cash_reserve
+            
+            logger.info(f"目标现金保留: ${target_cash_reserve:,.2f} ({target_cash_percentage:.1%})")
+            logger.info(f"可投资总金额: ${investable_total:,.2f}")
+            
+            # 计算等权重目标分配
+            num_stocks = len(stock_rows)
+            if num_stocks == 0:
+                logger.warning("没有股票可以投资")
+                return None
+                
+            target_value_per_stock = investable_total / num_stocks
+            
+            logger.info(f"股票数量: {num_stocks}")
+            logger.info(f"每只股票目标价值: ${target_value_per_stock:,.2f}")
+            logger.info(f"等权重比例: {1/num_stocks:.2%}")
+            
+            # 计算再平衡指令
+            rebalance_actions = []
+            total_buy_needed = 0
+            total_sell_available = 0
+            
+            for _, stock in stock_rows.iterrows():
+                current_value = stock['value']
+                target_value = target_value_per_stock
+                difference = target_value - current_value
+                
+                # 计算需要买卖的股数
+                if abs(difference) > 1.0:  # 只处理差异大于$1的情况
+                    if difference > 0:
+                        # 需要买入
+                        shares_to_buy = difference / stock['price']
+                        action = 'BUY'
+                        shares = int(shares_to_buy)  # 向下取整
+                        actual_amount = shares * stock['price']
+                        total_buy_needed += actual_amount
+                    else:
+                        # 需要卖出
+                        shares_to_sell = abs(difference) / stock['price']
+                        action = 'SELL'
+                        shares = int(shares_to_sell)  # 向下取整
+                        actual_amount = shares * stock['price']
+                        total_sell_available += actual_amount
+                    
+                    if shares > 0:  # 只记录有效交易
+                        rebalance_actions.append({
+                            'symbol': stock['symbol'],
+                            'action': action,
+                            'shares': shares,
+                            'price': stock['price'],
+                            'amount': actual_amount,
+                            'current_value': current_value,
+                            'target_value': target_value,
+                            'difference': difference,
+                            'current_weight': current_value / total_portfolio_value,
+                            'target_weight': target_value / total_portfolio_value
+                        })
+            
+            if not rebalance_actions:
+                logger.info("投资组合已接近等权重，无需再平衡")
+                return None
+                
+            rebalance_df = pd.DataFrame(rebalance_actions)
+            
+            # 计算现金使用情况
+            net_cash_needed = total_buy_needed - total_sell_available
+            cash_after_rebalance = available_cash - net_cash_needed
+            
+            logger.info(f"\n=== 再平衡统计 ===")
+            logger.info(f"需要买入总额: ${total_buy_needed:,.2f}")
+            logger.info(f"可卖出总额: ${total_sell_available:,.2f}")
+            logger.info(f"净现金需求: ${net_cash_needed:,.2f}")
+            logger.info(f"剩余现金: ${cash_after_rebalance:,.2f}")
+            
+            # 检查现金是否充足
+            if net_cash_needed > available_cash:
+                logger.warning(f"现金不足！需要 ${net_cash_needed:,.2f}，但只有 ${available_cash:,.2f}")
+                logger.info("建议减少买入金额或增加卖出金额")
+            
+            return rebalance_df
+            
+        except Exception as e:
+            logger.error(f"计算等权重再平衡失败: {e}")
+            return None
+    
+    def generate_rebalance_report(self, portfolio_df, rebalance_df, save_to_file=True):
+        """
+        生成再平衡报告
+        
+        Args:
+            portfolio_df: 投资组合DataFrame
+            rebalance_df: 再平衡指令DataFrame
+            save_to_file: 是否保存到文件
+            
+        Returns:
+            报告字符串
+        """
+        try:
+            if portfolio_df is None or portfolio_df.empty:
+                return "无投资组合数据"
+                
+            report_lines = []
+            report_lines.append("=" * 80)
+            report_lines.append("投资组合等权重再平衡报告")
+            report_lines.append(f"生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            report_lines.append("=" * 80)
+            
+            # 当前投资组合概览
+            total_value = portfolio_df['value'].sum()
+            report_lines.append(f"\n📊 当前投资组合概览:")
+            report_lines.append(f"总价值: ${total_value:,.2f}")
+            report_lines.append(f"股票数量: {len(portfolio_df)}")
+            report_lines.append(f"平均每股价值: ${total_value/len(portfolio_df):,.2f}")
+            
+            # 当前持仓详情
+            report_lines.append(f"\n📋 当前持仓详情:")
+            report_lines.append(f"{'股票代码':<8} {'价格':<8} {'股数':<8} {'价值':<12} {'权重':<8}")
+            report_lines.append("-" * 50)
+            
+            for _, stock in portfolio_df.iterrows():
+                weight = stock['value'] / total_value
+                report_lines.append(
+                    f"{stock['symbol']:<8} "
+                    f"${stock['price']:<7.2f} "
+                    f"{stock['shares']:<8.0f} "
+                    f"${stock['value']:<11.2f} "
+                    f"{weight:<7.1%}"
+                )
+            
+            # 再平衡指令
+            if rebalance_df is not None and not rebalance_df.empty:
+                report_lines.append(f"\n🔄 再平衡交易指令:")
+                report_lines.append(f"{'股票代码':<8} {'操作':<6} {'股数':<8} {'金额':<12} {'当前权重':<8} {'目标权重':<8}")
+                report_lines.append("-" * 60)
+                
+                for _, action in rebalance_df.iterrows():
+                    report_lines.append(
+                        f"{action['symbol']:<8} "
+                        f"{action['action']:<6} "
+                        f"{action['shares']:<8.0f} "
+                        f"${action['amount']:<11.2f} "
+                        f"{action['current_weight']:<7.1%} "
+                        f"{action['target_weight']:<7.1%}"
+                    )
+                
+                # 交易统计
+                buy_amount = rebalance_df[rebalance_df['action'] == 'BUY']['amount'].sum()
+                sell_amount = rebalance_df[rebalance_df['action'] == 'SELL']['amount'].sum()
+                
+                report_lines.append(f"\n💰 交易统计:")
+                report_lines.append(f"买入总额: ${buy_amount:,.2f}")
+                report_lines.append(f"卖出总额: ${sell_amount:,.2f}")
+                report_lines.append(f"净现金需求: ${buy_amount - sell_amount:,.2f}")
+            else:
+                report_lines.append(f"\n✅ 投资组合已接近等权重，无需再平衡")
+            
+            report_lines.append("\n" + "=" * 80)
+            
+            report = "\n".join(report_lines)
+            
+            if save_to_file:
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                filename = f"portfolio_rebalance_report_{timestamp}.txt"
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(report)
+                logger.info(f"报告已保存到: {filename}")
+            
+            return report
+            
+        except Exception as e:
+            logger.error(f"生成再平衡报告失败: {e}")
+            return f"生成报告失败: {e}"
+    
     def close(self):
         """关闭浏览器"""
         if self.driver:
@@ -364,25 +737,42 @@ class FixedSeekingAlphaScraper:
 
 
 def main():
-    """主函数示例"""
+    """主函数示例 - 支持本地HTML文件和在线爬取"""
+    
+    # 配置日志
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
     scraper = FixedSeekingAlphaScraper(use_existing_browser=True, debug_mode=True)
-
+    
+    # 检查是否有本地HTML文件
+    html_file_path = "portfolio_data_20250629_225241.html"
+    
     try:
-        # 设置浏览器
-        if not scraper.setup_driver():
-            return
+        if os.path.exists(html_file_path):
+            print(f"\n🔍 发现本地HTML文件: {html_file_path}")
+            print("正在解析本地文件...")
+            
+            # 解析本地HTML文件
+            df = scraper.parse_local_html_file(html_file_path)
+            
+        else:
+            print("\n🌐 未找到本地HTML文件，开始在线爬取...")
+            
+            # 设置浏览器
+            if not scraper.setup_driver():
+                return
 
-        # 导航到投资组合页面 (需要手动先登录)
-        portfolio_url = "https://seekingalpha.com/account/portfolio"
+            # 导航到投资组合页面 (需要手动先登录)
+            portfolio_url = "https://seekingalpha.com/account/portfolio"
 
-        print("请在浏览器中手动导航到您的投资组合页面，然后按Enter继续...")
-        input("按Enter继续爬取数据...")
+            print("请在浏览器中手动导航到您的投资组合页面，然后按Enter继续...")
+            input("按Enter继续爬取数据...")
 
-        # 爬取数据
-        df = scraper.scrape_portfolio_data_improved()
+            # 爬取数据
+            df = scraper.scrape_portfolio_data_improved()
 
         if df is not None:
-            print("\n=== 爬取结果 ===")
+            print("\n=== 📊 投资组合数据 ===")
             print(f"成功提取 {len(df)} 条记录")
             print("\n前10条数据:")
             print(df.head(10).to_string())
@@ -392,21 +782,86 @@ def main():
             csv_file = f"portfolio_data_{timestamp}.csv"
             df.to_csv(csv_file, index=False, encoding='utf-8-sig')
             print(f"\n数据已保存到: {csv_file}")
-
-            # 保存调试信息
-            debug_file = f"debug_portfolio_{timestamp}.html"
-            scraper.save_debug_info(debug_file)
+            
+            # 计算等权重再平衡
+            print("\n=== 🎯 开始计算等权重再平衡 ===")
+            rebalance_df = scraper.calculate_equal_weight_rebalance(
+                df, 
+                target_cash_percentage=0.05,  # 保留5%现金
+                exclude_symbols=['CASH']  # 排除现金项目
+            )
+            
+            # 生成报告
+            print("\n=== 📋 生成再平衡报告 ===")
+            report = scraper.generate_rebalance_report(df, rebalance_df)
+            print(report)
 
         else:
-            print("数据爬取失败，正在保存调试信息...")
-            scraper.save_debug_info("debug_failed_scrape.html")
+            print("❌ 数据获取失败")
+            if not os.path.exists(html_file_path):
+                print("正在保存调试信息...")
+                scraper.save_debug_info("debug_failed_scrape.html")
 
     except Exception as e:
-        print(f"程序执行出错: {e}")
+        print(f"❌ 程序执行出错: {e}")
+        import traceback
+        traceback.print_exc()
 
     finally:
         scraper.close()
 
 
+def analyze_html_file(html_file_path):
+    """独立的HTML文件分析函数"""
+    
+    # 配置日志
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    scraper = FixedSeekingAlphaScraper(debug_mode=True)
+    
+    try:
+        print(f"\n🔍 分析HTML文件: {html_file_path}")
+        
+        # 解析本地HTML文件
+        df = scraper.parse_local_html_file(html_file_path)
+        
+        if df is not None:
+            print("\n=== 📊 投资组合数据 ===")
+            print(f"成功提取 {len(df)} 条记录")
+            print(df.to_string())
+            
+            # 计算等权重再平衡
+            print("\n=== 🎯 计算等权重再平衡 ===")
+            rebalance_df = scraper.calculate_equal_weight_rebalance(
+                df, 
+                target_cash_percentage=0.0,  # 不保留现金
+                exclude_symbols=[]  # 不排除任何股票
+            )
+            
+            # 生成报告
+            print("\n=== 📋 再平衡报告 ===")
+            report = scraper.generate_rebalance_report(df, rebalance_df)
+            print(report)
+            
+            return df, rebalance_df
+        else:
+            print("❌ 数据解析失败")
+            return None, None
+            
+    except Exception as e:
+        print(f"❌ 分析失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None
+
+
 if __name__ == "__main__":
-    main()
+    # 检查命令行参数
+    import sys
+    
+    if len(sys.argv) > 1:
+        html_file_path = sys.argv[1]
+        print(f"使用指定的HTML文件: {html_file_path}")
+        analyze_html_file(html_file_path)
+    else:
+        main()
