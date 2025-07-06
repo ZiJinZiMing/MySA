@@ -2,9 +2,28 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## ⚠️ CRITICAL ARCHITECTURE REQUIREMENT
+
+**ALL project functionality is 100% dependent on Chrome Remote Debugging (port 9222)**
+
+🔴 **For Claude Code**: When developing ANY new features for this project, you MUST:
+1. Use Chrome remote debugging connection on port 9222
+2. Connect to existing Chrome instance with `debuggerAddress: "127.0.0.1:9222"`
+3. Leverage the browser's logged-in session state
+4. Access SeekingAlpha through real browser environment for anti-detection
+
+**Never suggest**: Direct HTTP requests, headless browsers, or API calls - ALL data must be retrieved through the Chrome debugging connection.
+
 ## 项目概述
 
-这是一个基于Python的SeekingAlpha数据爬取和分析工具包，用于提取股票投资组合数据、评级信息并进行投资分析。项目使用Selenium WebDriver自动化浏览器与SeekingAlpha网站的交互。
+这是一个基于Python和Chrome远程调试架构的SeekingAlpha数据爬取和分析工具包，用于提取股票投资组合数据、评级信息并进行投资分析。
+
+### 🔧 核心架构依赖
+**所有项目功能都依赖Chrome远程调试连接**：
+- **端口9222**: 硬编码使用此端口连接Chrome实例
+- **实时数据**: 通过真实浏览器环境访问SeekingAlpha
+- **会话保持**: 利用浏览器已登录状态，无需重复认证
+- **统一访问**: 所有脚本共享同一个Chrome进程和网络会话
 
 ## 运行应用程序
 
@@ -29,12 +48,15 @@ python src/mstr_btc.py
 
 # 运行增强功能测试
 python src/test_enhanced_functionality.py
+
+# 投资组合等权重再平衡分析 (NEW!)
+python src/PortfolioRebalancingCalculator.py 64139349
 ```
 
 ### 依赖项
 安装所需包：
 ```bash
-pip install pandas numpy beautifulsoup4 selenium requests yfinance
+pip install pandas numpy beautifulsoup4 selenium requests yfinance matplotlib seaborn
 ```
 
 ## 架构概述
@@ -112,3 +134,49 @@ driver = webdriver.Chrome(options=chrome_options)
 - 请求间随机延迟（1-3秒，每10-40只股票后增加更长延迟）
 - 通过现有浏览器实例进行用户代理和会话管理
 - 渐进式数据保存避免中断时丢失工作进度
+
+## 投资组合再平衡分析 (PortfolioRebalancingCalculator.py)
+
+### 核心功能
+- **数据获取**: 从SeekingAlpha自动获取投资组合持仓数据
+- **等权重分析**: 计算等权重再平衡策略和交易指令
+- **可视化报告**: 生成详细的分析报告和图表
+- **离线支持**: 支持本地HTML文件解析，避免重复网络请求
+
+### 使用方式
+```bash
+# 使用默认投资组合ID (64139349)
+python src/PortfolioRebalancingCalculator.py
+
+# 使用指定投资组合ID
+python src/PortfolioRebalancingCalculator.py YOUR_PORTFOLIO_ID
+
+# 分析本地HTML文件
+python src/PortfolioRebalancingCalculator.py portfolio_data.html
+
+# Python API使用
+from PortfolioRebalancingCalculator import quick_analyze_portfolio
+df, rebalance_df = quick_analyze_portfolio('64139349')
+```
+
+### 输出文件
+- **HTML备份**: `portfolio_data_{portfolio_id}.html` - 原始网页数据
+- **分析报告**: `portfolio_rebalance_report_{timestamp}.txt` - 详细再平衡报告
+- **可视化图表**: 
+  - `portfolio_weights_pie_{timestamp}.png` - 权重分布饼图
+  - `rebalance_comparison_{timestamp}.png` - 再平衡对比图
+  - `trade_distribution_{timestamp}.png` - 交易分布图
+  - `portfolio_dashboard_{timestamp}.png` - 综合仪表板
+
+## 详细技术文档
+
+📋 **完整项目架构和设计文档**: [PROJECT_ARCHITECTURE.md](./PROJECT_ARCHITECTURE.md)
+
+该文档包含：
+- 系统架构图和类设计图
+- 核心算法流程图  
+- 功能模块组织图
+- 技术栈和依赖关系图
+- 详细的实现说明和扩展指南
+
+建议开发者和维护者阅读该文档以深入理解项目设计思路。

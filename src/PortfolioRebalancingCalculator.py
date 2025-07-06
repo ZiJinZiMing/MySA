@@ -1490,13 +1490,65 @@ class FixedSeekingAlphaScraper:
             logger.error(f"生成可视化图表失败: {e}")
             return []
     
+    def scrape_portfolio_by_id(self, portfolio_id, save_html=True):
+        """
+        通过投资组合ID直接获取数据
+        
+        Args:
+            portfolio_id: 投资组合ID
+            save_html: 是否保存HTML文件
+            
+        Returns:
+            投资组合数据DataFrame
+        """
+        try:
+            if not self.driver:
+                if not self.setup_driver():
+                    return None
+            
+            # 构建URL
+            portfolio_url = f"https://seekingalpha.com/account/portfolio/total_view?portfolioId={portfolio_id}"
+            
+            logger.info(f"正在访问投资组合: {portfolio_url}")
+            self.driver.get(portfolio_url)
+            
+            # 等待页面加载
+            time.sleep(5)
+            
+            # 检查是否需要登录
+            if "login" in self.driver.current_url.lower():
+                logger.warning("需要登录到SeekingAlpha账户")
+                return None
+            
+            # 保存HTML文件
+            if save_html:
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                backup_html_path = f"portfolio_data_{portfolio_id}_{timestamp}.html"
+                standard_html_path = f"portfolio_data_{portfolio_id}.html"
+                
+                try:
+                    with open(backup_html_path, 'w', encoding='utf-8') as f:
+                        f.write(self.driver.page_source)
+                    with open(standard_html_path, 'w', encoding='utf-8') as f:
+                        f.write(self.driver.page_source)
+                    logger.info(f"页面HTML已保存: {backup_html_path}, {standard_html_path}")
+                except Exception as e:
+                    logger.error(f"保存HTML文件失败: {e}")
+            
+            # 爬取数据
+            return self.scrape_portfolio_data_improved()
+            
+        except Exception as e:
+            logger.error(f"通过ID获取投资组合数据失败: {e}")
+            return None
+
     def close(self):
         """关闭浏览器"""
         if self.driver:
             self.driver.quit()
 
 
-def main():
+def main(portfolio_id=None):
     """主函数示例 - 支持本地HTML文件和在线爬取"""
     
     # 配置日志
@@ -1504,8 +1556,12 @@ def main():
     
     scraper = FixedSeekingAlphaScraper(use_existing_browser=True, debug_mode=True)
     
+    # 优先级：命令行参数 > 默认值
+    if portfolio_id is None:
+        portfolio_id = "64139349"  # 默认投资组合ID
+    
     # 检查是否有本地HTML文件
-    html_file_path = "portfolio_data_20250629_225241.html"
+    html_file_path = f"portfolio_data_{portfolio_id}.html"
     
     try:
         if os.path.exists(html_file_path):
@@ -1516,17 +1572,48 @@ def main():
             df = scraper.parse_local_html_file(html_file_path)
             
         else:
-            print("\n🌐 未找到本地HTML文件，开始在线爬取...")
+            print(f"\n🌐 未找到本地HTML文件，开始在线爬取投资组合 {portfolio_id}...")
             
             # 设置浏览器
             if not scraper.setup_driver():
                 return
 
-            # 导航到投资组合页面 (需要手动先登录)
-            portfolio_url = "https://seekingalpha.com/account/portfolio"
+            # 导航到指定的投资组合页面
+            portfolio_url = f"https://seekingalpha.com/account/portfolio/total_view?portfolioId={portfolio_id}"
+            
+            print(f"正在导航到: {portfolio_url}")
+            scraper.driver.get(portfolio_url)
+            
+            # 等待页面加载
+            print("等待页面加载...")
+            time.sleep(5)
+            
+            # 检查是否需要登录
+            if "login" in scraper.driver.current_url.lower():
+                print("⚠️ 需要登录到SeekingAlpha账户")
+                print("请在浏览器中完成登录，然后按Enter继续...")
+                input("按Enter继续爬取数据...")
+                
+                # 重新导航到投资组合页面
+                scraper.driver.get(portfolio_url)
+                time.sleep(5)
 
-            print("请在浏览器中手动导航到您的投资组合页面，然后按Enter继续...")
-            input("按Enter继续爬取数据...")
+            # 保存页面HTML用于后续分析
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            backup_html_path = f"portfolio_data_{portfolio_id}_{timestamp}.html"
+            
+            try:
+                with open(backup_html_path, 'w', encoding='utf-8') as f:
+                    f.write(scraper.driver.page_source)
+                print(f"页面HTML已保存: {backup_html_path}")
+                
+                # 同时保存一个不带时间戳的版本供下次使用
+                standard_html_path = f"portfolio_data_{portfolio_id}.html"
+                with open(standard_html_path, 'w', encoding='utf-8') as f:
+                    f.write(scraper.driver.page_source)
+                print(f"标准HTML已保存: {standard_html_path}")
+            except Exception as e:
+                print(f"保存HTML文件失败: {e}")
 
             # 爬取数据
             df = scraper.scrape_portfolio_data_improved()
@@ -1635,13 +1722,63 @@ def analyze_html_file(html_file_path):
         return None, None
 
 
+def quick_analyze_portfolio(portfolio_id):
+    """
+    快速分析投资组合的便捷函数
+    
+    Args:
+        portfolio_id: 投资组合ID
+        
+    Returns:
+        投资组合数据DataFrame和再平衡数据DataFrame
+    """
+    scraper = FixedSeekingAlphaScraper(use_existing_browser=True, debug_mode=False)
+    
+    try:
+        # 尝试先从本地文件加载
+        html_file_path = f"portfolio_data_{portfolio_id}.html"
+        if os.path.exists(html_file_path):
+            print(f"从本地文件加载数据: {html_file_path}")
+            df = scraper.parse_local_html_file(html_file_path)
+        else:
+            # 在线获取数据
+            print(f"在线获取投资组合数据: {portfolio_id}")
+            df = scraper.scrape_portfolio_by_id(portfolio_id)
+        
+        if df is not None:
+            # 计算再平衡
+            rebalance_df = scraper.calculate_equal_weight_rebalance(df, target_cash_percentage=0.05)
+            
+            # 生成报告
+            report = scraper.generate_rebalance_report(df, rebalance_df, save_to_file=True)
+            print(report)
+            
+            return df, rebalance_df
+        else:
+            print("无法获取投资组合数据")
+            return None, None
+            
+    except Exception as e:
+        print(f"分析失败: {e}")
+        return None, None
+    finally:
+        scraper.close()
+
+
 if __name__ == "__main__":
     # 检查命令行参数
     import sys
     
     if len(sys.argv) > 1:
-        html_file_path = sys.argv[1]
-        print(f"使用指定的HTML文件: {html_file_path}")
-        analyze_html_file(html_file_path)
+        # 检查第一个参数是否为HTML文件
+        if sys.argv[1].endswith('.html'):
+            html_file_path = sys.argv[1]
+            print(f"使用指定的HTML文件: {html_file_path}")
+            analyze_html_file(html_file_path)
+        else:
+            # 第一个参数作为投资组合ID
+            portfolio_id = sys.argv[1]
+            print(f"使用指定的投资组合ID: {portfolio_id}")
+            main(portfolio_id)
     else:
         main()
