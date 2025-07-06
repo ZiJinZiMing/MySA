@@ -143,7 +143,23 @@ driver = webdriver.Chrome(options=chrome_options)
 - **可视化报告**: 生成详细的分析报告和图表
 - **离线支持**: 支持本地HTML文件解析，避免重复网络请求
 
-### 使用方式
+### 🆕 增强功能特性
+
+#### 1. 固定现金金额保留
+- **功能**: 保留指定固定金额的现金，而非百分比
+- **优先级**: `target_cash_amount` 参数优先于 `target_cash_percentage`
+- **用途**: 确保投资组合中始终保持具体的现金储备
+
+#### 2. 指定股票清仓功能
+- **功能**: 配置特定股票完全清仓
+- **资金流**: 清仓获得的资金自动用于再平衡计算
+- **灵活性**: 可同时清仓多只股票
+
+#### 3. 组合功能使用
+- **功能**: 可同时使用固定现金和清仓功能
+- **智能计算**: 自动处理清仓资金与现金保留的逻辑关系
+
+### 基础使用方式
 ```bash
 # 使用默认投资组合ID (64139349)
 python src/PortfolioRebalancingCalculator.py
@@ -153,11 +169,44 @@ python src/PortfolioRebalancingCalculator.py YOUR_PORTFOLIO_ID
 
 # 分析本地HTML文件
 python src/PortfolioRebalancingCalculator.py portfolio_data.html
-
-# Python API使用
-from PortfolioRebalancingCalculator import quick_analyze_portfolio
-df, rebalance_df = quick_analyze_portfolio('64139349')
 ```
+
+### 增强功能API使用
+```python
+from PortfolioRebalancingCalculator import quick_analyze_portfolio
+
+# 基础等权重再平衡
+df, rebalance_df = quick_analyze_portfolio('64139349')
+
+# 保留固定现金金额 $12,000
+df, rebalance_df = quick_analyze_portfolio(
+    portfolio_id='64139349',
+    target_cash_amount=12000,
+    exclude_symbols=['CASH']
+)
+
+# 清仓特定股票
+df, rebalance_df = quick_analyze_portfolio(
+    portfolio_id='64139349', 
+    target_cash_percentage=0.05,
+    liquidate_symbols=['AEVA', 'EXE'],
+    exclude_symbols=['CASH']
+)
+
+# 组合使用：固定现金 + 清仓
+df, rebalance_df = quick_analyze_portfolio(
+    portfolio_id='64139349',
+    target_cash_amount=15000,  # 固定现金优先
+    liquidate_symbols=['APP'],
+    exclude_symbols=['CASH']
+)
+```
+
+### 增强功能参数说明
+- **`target_cash_amount`**: 保留的固定现金金额（美元）
+- **`liquidate_symbols`**: 需要清仓的股票代码列表
+- **`target_cash_percentage`**: 现金保留百分比（当未指定固定金额时使用）
+- **`exclude_symbols`**: 从再平衡中排除的股票代码列表
 
 ### 输出文件
 - **HTML备份**: `portfolio_data_{portfolio_id}.html` - 原始网页数据

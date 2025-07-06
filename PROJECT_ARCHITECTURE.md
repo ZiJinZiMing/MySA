@@ -172,9 +172,12 @@ flowchart LR
 - **数据验证机制**：确保提取数据的完整性和准确性
 
 ### 等权重再平衡算法特点：
-- **灵活现金管理**：支持设置目标现金保留比例
+- **灵活现金管理**：支持设置目标现金保留比例或固定金额
 - **精确交易计算**：精确到股数级别的买卖指令
 - **现金流分析**：详细的现金需求和可用性分析
+- **🆕 固定现金金额**：支持保留指定固定金额现金，优先级高于百分比
+- **🆕 股票清仓功能**：支持指定特定股票完全清仓
+- **🆕 清仓资金再投资**：清仓获得的资金自动用于等权重再平衡
 
 ## 5. 功能模块组织
 
@@ -316,13 +319,40 @@ python3 src/PortfolioRebalancingCalculator.py portfolio_data.html
 ```python
 from PortfolioRebalancingCalculator import quick_analyze_portfolio, FixedSeekingAlphaScraper
 
-# 快速分析
+# 基础快速分析
 df, rebalance_df = quick_analyze_portfolio('64139349')
+
+# 🆕 增强功能：固定现金金额
+df, rebalance_df = quick_analyze_portfolio(
+    portfolio_id='64139349',
+    target_cash_amount=12000,  # 保留$12,000现金
+    exclude_symbols=['CASH']
+)
+
+# 🆕 增强功能：股票清仓
+df, rebalance_df = quick_analyze_portfolio(
+    portfolio_id='64139349',
+    target_cash_percentage=0.05,
+    liquidate_symbols=['AEVA', 'EXE'],  # 清仓指定股票
+    exclude_symbols=['CASH']
+)
+
+# 🆕 增强功能：组合使用
+df, rebalance_df = quick_analyze_portfolio(
+    portfolio_id='64139349',
+    target_cash_amount=15000,  # 固定现金优先
+    liquidate_symbols=['APP'],  # 同时清仓
+    exclude_symbols=['CASH']
+)
 
 # 详细控制
 scraper = FixedSeekingAlphaScraper()
 df = scraper.scrape_portfolio_by_id('64139349')
-rebalance_df = scraper.calculate_equal_weight_rebalance(df)
+rebalance_df = scraper.calculate_equal_weight_rebalance(
+    df, 
+    target_cash_amount=10000,
+    liquidate_symbols=['STOCK1', 'STOCK2']
+)
 ```
 
 ## 9. 输出文件说明
@@ -344,6 +374,11 @@ rebalance_df = scraper.calculate_equal_weight_rebalance(df)
 
 ### 可扩展功能点
 1. **多种再平衡策略**: 支持风险平价、市值加权等策略
+2. **🆕 已实现增强功能**:
+   - **固定现金金额保留**: 支持保留指定固定金额现金
+   - **股票清仓配置**: 支持指定特定股票完全清仓
+   - **清仓资金再投资**: 清仓资金自动用于等权重再平衡
+   - **组合功能使用**: 可同时使用多种增强功能
 2. **历史数据分析**: 集成历史价格数据进行回测
 3. **实时监控**: 添加定时任务和通知功能
 4. **多平台支持**: 扩展到其他投资平台
@@ -356,5 +391,5 @@ rebalance_df = scraper.calculate_equal_weight_rebalance(df)
 
 ---
 
-*本文档生成时间: 2025-07-06*
-*项目版本: v1.0*
+*本文档更新时间: 2025-07-06*
+*项目版本: v2.0 (增强功能版)*

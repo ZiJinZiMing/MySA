@@ -530,59 +530,95 @@ class FixedSeekingAlphaScraper:
                 logger.debug(f"提取股票数据失败: {e}")
             return None
     
-    def calculate_equal_weight_rebalance(self, portfolio_df, target_cash_percentage=0.0, exclude_symbols=None):
+    def calculate_equal_weight_rebalance(self, portfolio_df, target_cash_percentage=0.0, exclude_symbols=None, 
+                                       target_cash_amount=None, liquidate_symbols=None):
         """
-        计算等权重再平衡策略
+        计算等权重再平衡策略（增强版）
         
         Args:
             portfolio_df: 投资组合DataFrame
             target_cash_percentage: 目标现金比例 (0.0-1.0)
             exclude_symbols: 排除的股票代码列表
+            target_cash_amount: 目标固定现金金额 (优先级高于百分比)
+            liquidate_symbols: 需要清仓的股票代码列表
             
         Returns:
             再平衡指令DataFrame
         """
         try:
-            logger.info("开始计算等权重再平衡策略")
+            logger.info("开始计算等权重再平衡策略（增强版）")
             
             if portfolio_df is None or portfolio_df.empty:
                 logger.error("投资组合数据为空")
                 return None
             
+            # 初始化参数
+            if exclude_symbols is None:
+                exclude_symbols = []
+            if liquidate_symbols is None:
+                liquidate_symbols = []
+            
             # 分离现金和股票
             cash_rows = portfolio_df[portfolio_df['symbol'] == 'CASH']
-            stock_rows = portfolio_df[portfolio_df['symbol'] != 'CASH']
+            stock_rows = portfolio_df[portfolio_df['symbol'] != 'CASH'].copy()
             
-            # 过滤排除的股票
-            if exclude_symbols:
-                stock_rows = stock_rows[~stock_rows['symbol'].isin(exclude_symbols)]
-                logger.info(f"排除股票: {exclude_symbols}")
-            
-            # 计算总资产价值（包括现金）
+            # 计算总资产价值
             total_portfolio_value = portfolio_df['value'].sum()
             available_cash = cash_rows['value'].sum() if not cash_rows.empty else 0
-            stock_value = stock_rows['value'].sum()
             
             logger.info(f"投资组合总价值: ${total_portfolio_value:,.2f}")
-            logger.info(f"可用现金: ${available_cash:,.2f}")
-            logger.info(f"股票总价值: ${stock_value:,.2f}")
+            logger.info(f"当前现金: ${available_cash:,.2f}")
             
-            # 计算可投资总金额（总资产减去目标现金保留）
-            target_cash_reserve = total_portfolio_value * target_cash_percentage
-            investable_total = total_portfolio_value - target_cash_reserve
+            # 处理清仓股票
+            liquidation_proceeds = 0
+            liquidated_stocks = pd.DataFrame()  # 初始化为空DataFrame
+            if liquidate_symbols:
+                liquidation_mask = stock_rows['symbol'].isin(liquidate_symbols)
+                liquidated_stocks = stock_rows[liquidation_mask].copy()
+                liquidation_proceeds = liquidated_stocks['value'].sum()
+                
+                # 从投资股票中移除清仓股票
+                stock_rows = stock_rows[~liquidation_mask]
+                
+                logger.info(f"清仓股票: {liquidate_symbols}")
+                logger.info(f"清仓获得资金: ${liquidation_proceeds:,.2f}")
             
-            logger.info(f"目标现金保留: ${target_cash_reserve:,.2f} ({target_cash_percentage:.1%})")
-            logger.info(f"可投资总金额: ${investable_total:,.2f}")
+            # 处理排除股票
+            if exclude_symbols:
+                exclude_mask = stock_rows['symbol'].isin(exclude_symbols)
+                excluded_stocks = stock_rows[exclude_mask].copy()
+                stock_rows = stock_rows[~exclude_mask]
+                logger.info(f"排除股票: {exclude_symbols}")
+            
+            # 计算目标现金保留
+            if target_cash_amount is not None:
+                # 使用固定金额
+                target_cash_reserve = target_cash_amount
+                logger.info(f"目标现金保留: ${target_cash_reserve:,.2f} (固定金额)")
+            else:
+                # 使用百分比
+                target_cash_reserve = total_portfolio_value * target_cash_percentage
+                logger.info(f"目标现金保留: ${target_cash_reserve:,.2f} ({target_cash_percentage:.1%})")
+            
+            # 计算可投资总金额
+            total_available_for_investment = available_cash + liquidation_proceeds
+            investable_total = total_portfolio_value + liquidation_proceeds - target_cash_reserve
+            
+            logger.info(f"总可投资金额: ${investable_total:,.2f}")
+            logger.info(f"当前可用资金: ${total_available_for_investment:,.2f}")
             
             # 计算等权重目标分配
             num_stocks = len(stock_rows)
             if num_stocks == 0:
                 logger.warning("没有股票可以投资")
+                # 如果有清仓股票，仍然返回清仓指令
+                if liquidated_stocks is not None and not liquidated_stocks.empty:
+                    return self._create_liquidation_only_df(liquidated_stocks)
                 return None
                 
             target_value_per_stock = investable_total / num_stocks
             
-            logger.info(f"股票数量: {num_stocks}")
+            logger.info(f"剩余股票数量: {num_stocks}")
             logger.info(f"每只股票目标价值: ${target_value_per_stock:,.2f}")
             logger.info(f"等权重比例: {1/num_stocks:.2%}")
             
@@ -591,6 +627,25 @@ class FixedSeekingAlphaScraper:
             total_buy_needed = 0
             total_sell_available = 0
             
+            # 1. 添加清仓指令
+            if liquidated_stocks is not None and not liquidated_stocks.empty:
+                for _, stock in liquidated_stocks.iterrows():
+                    rebalance_actions.append({
+                        'symbol': stock['symbol'],
+                        'action': 'LIQUIDATE',
+                        'shares': int(stock['shares']),
+                        'price': stock['price'],
+                        'amount': stock['value'],
+                        'current_value': stock['value'],
+                        'target_value': 0,
+                        'difference': -stock['value'],
+                        'current_weight': stock['value'] / total_portfolio_value,
+                        'target_weight': 0,
+                        'reason': '清仓'
+                    })
+                    total_sell_available += stock['value']
+            
+            # 2. 计算其余股票的再平衡
             for _, stock in stock_rows.iterrows():
                 current_value = stock['value']
                 target_value = target_value_per_stock
@@ -624,28 +679,35 @@ class FixedSeekingAlphaScraper:
                             'target_value': target_value,
                             'difference': difference,
                             'current_weight': current_value / total_portfolio_value,
-                            'target_weight': target_value / total_portfolio_value
+                            'target_weight': target_value / (total_portfolio_value + liquidation_proceeds),
+                            'reason': '再平衡'
                         })
             
+            # 检查是否有任何交易指令
             if not rebalance_actions:
                 logger.info("投资组合已接近等权重，无需再平衡")
                 return None
                 
             rebalance_df = pd.DataFrame(rebalance_actions)
             
-            # 计算现金使用情况
+            # 计算现金使用情况（包含清仓资金）
+            total_available_cash = available_cash + liquidation_proceeds
             net_cash_needed = total_buy_needed - total_sell_available
-            cash_after_rebalance = available_cash - net_cash_needed
+            cash_after_rebalance = total_available_cash - net_cash_needed
             
-            logger.info(f"\n=== 再平衡统计 ===")
+            logger.info(f"\n=== 再平衡统计（增强版）===")
+            logger.info(f"初始现金: ${available_cash:,.2f}")
+            logger.info(f"清仓获得: ${liquidation_proceeds:,.2f}")
+            logger.info(f"总可用现金: ${total_available_cash:,.2f}")
             logger.info(f"需要买入总额: ${total_buy_needed:,.2f}")
-            logger.info(f"可卖出总额: ${total_sell_available:,.2f}")
+            logger.info(f"卖出获得总额: ${total_sell_available:,.2f}")
             logger.info(f"净现金需求: ${net_cash_needed:,.2f}")
-            logger.info(f"剩余现金: ${cash_after_rebalance:,.2f}")
+            logger.info(f"预期剩余现金: ${cash_after_rebalance:,.2f}")
+            logger.info(f"目标现金保留: ${target_cash_reserve:,.2f}")
             
             # 检查现金是否充足
-            if net_cash_needed > available_cash:
-                logger.warning(f"现金不足！需要 ${net_cash_needed:,.2f}，但只有 ${available_cash:,.2f}")
+            if net_cash_needed > total_available_cash:
+                logger.warning(f"现金不足！需要 ${net_cash_needed:,.2f}，但只有 ${total_available_cash:,.2f}")
                 logger.info("建议减少买入金额或增加卖出金额")
             
             return rebalance_df
@@ -653,6 +715,25 @@ class FixedSeekingAlphaScraper:
         except Exception as e:
             logger.error(f"计算等权重再平衡失败: {e}")
             return None
+    
+    def _create_liquidation_only_df(self, liquidated_stocks):
+        """创建仅包含清仓指令的DataFrame"""
+        liquidation_actions = []
+        for _, stock in liquidated_stocks.iterrows():
+            liquidation_actions.append({
+                'symbol': stock['symbol'],
+                'action': 'LIQUIDATE',
+                'shares': int(stock['shares']),
+                'price': stock['price'],
+                'amount': stock['value'],
+                'current_value': stock['value'],
+                'target_value': 0,
+                'difference': -stock['value'],
+                'current_weight': stock['weight'] if 'weight' in stock else 0,
+                'target_weight': 0,
+                'reason': '清仓'
+            })
+        return pd.DataFrame(liquidation_actions)
     
     def generate_rebalance_report(self, portfolio_df, rebalance_df, save_to_file=True):
         """
@@ -1630,13 +1711,22 @@ def main(portfolio_id=None):
             df.to_csv(csv_file, index=False, encoding='utf-8-sig')
             print(f"\n数据已保存到: {csv_file}")
             
-            # 计算等权重再平衡
-            print("\n=== 🎯 开始计算等权重再平衡 ===")
+            # 计算等权重再平衡（增强版示例）
+            print("\n=== 🎯 开始计算等权重再平衡（增强版）===")
+            
+            # 示例配置 - 根据需要修改这些参数
             rebalance_df = scraper.calculate_equal_weight_rebalance(
                 df, 
-                target_cash_percentage=0.05,  # 保留5%现金
-                exclude_symbols=['CASH']  # 排除现金项目
+                target_cash_percentage=None,  # 保留5%现金
+                target_cash_amount=2000,  # 或使用固定金额如: 10000
+                exclude_symbols=['CASH'],  # 排除现金项目
+                liquidate_symbols=["GAP","TLN","MFC","NRG","MAPS","TWLO","OKTA","AGX","RCL"]  # 清仓股票列表，如: ['AAPL', 'MSFT']
             )
+            
+            print("\n💡 新功能说明:")
+            print("- target_cash_amount: 设置固定现金金额（优先级高于百分比）")
+            print("- liquidate_symbols: 指定需要清仓的股票")
+            print("- 清仓资金将用于其他股票的再平衡")
             
             # 生成报告
             print("\n=== 📋 生成再平衡报告 ===")
@@ -1722,12 +1812,17 @@ def analyze_html_file(html_file_path):
         return None, None
 
 
-def quick_analyze_portfolio(portfolio_id):
+def quick_analyze_portfolio(portfolio_id, target_cash_amount=None, target_cash_percentage=0.05, 
+                           liquidate_symbols=None, exclude_symbols=None):
     """
-    快速分析投资组合的便捷函数
+    快速分析投资组合的便捷函数（增强版）
     
     Args:
         portfolio_id: 投资组合ID
+        target_cash_amount: 目标固定现金金额 (优先级高于百分比)
+        target_cash_percentage: 目标现金比例 (默认5%)
+        liquidate_symbols: 需要清仓的股票代码列表
+        exclude_symbols: 排除的股票代码列表
         
     Returns:
         投资组合数据DataFrame和再平衡数据DataFrame
@@ -1746,8 +1841,14 @@ def quick_analyze_portfolio(portfolio_id):
             df = scraper.scrape_portfolio_by_id(portfolio_id)
         
         if df is not None:
-            # 计算再平衡
-            rebalance_df = scraper.calculate_equal_weight_rebalance(df, target_cash_percentage=0.05)
+            # 计算增强版再平衡
+            rebalance_df = scraper.calculate_equal_weight_rebalance(
+                df, 
+                target_cash_percentage=target_cash_percentage,
+                target_cash_amount=target_cash_amount,
+                liquidate_symbols=liquidate_symbols,
+                exclude_symbols=exclude_symbols
+            )
             
             # 生成报告
             report = scraper.generate_rebalance_report(df, rebalance_df, save_to_file=True)
