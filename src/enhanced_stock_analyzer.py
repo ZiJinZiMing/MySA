@@ -51,6 +51,11 @@ class AntiCrawlerManager:
         self.current_requests = 0
         self.start_time = datetime.now()
         
+        # 机器人检测相关
+        self.bot_detection_count = 0     # 检测到机器人验证的次数
+        self.adaptive_mode = False       # 是否启用自适应模式
+        self.base_delay_multiplier = 1.0 # 延时倍数
+        
         logger.info("🛡️ 反爬虫管理器已初始化 - 限制: 80次/2分钟")
     
     def record_request(self):
@@ -65,18 +70,168 @@ class AntiCrawlerManager:
             logger.info(f"🛡️ 达到{self.current_requests}次请求，批次延时: {batch_delay:.1f}秒")
             time.sleep(batch_delay)
     
-    def get_smart_delay(self) -> float:
-        """获取智能延时时间"""
-        if self.current_requests <= 40:
-            delay = random.uniform(1.5, 3.0)  # 基础延时
-        elif self.current_requests <= 60:
-            delay = random.uniform(3.0, 5.0)  # 中等延时
-        elif self.current_requests <= 75:
-            delay = random.uniform(5.0, 8.0)  # 较长延时
-        else:
-            delay = random.uniform(8.0, 12.0) # 临界延时
+    def detect_bot_verification(self, driver) -> bool:
+        """
+        检测当前页面是否触发了机器人验证
         
-        return delay
+        Args:
+            driver: Selenium WebDriver实例
+            
+        Returns:
+            是否检测到机器人验证
+        """
+        try:
+            # 获取当前页面标题和URL
+            current_url = driver.current_url.lower()
+            page_title = driver.title.lower()
+            
+            # 检测常见的机器人验证指标
+            bot_indicators = [
+                # URL指标
+                'captcha' in current_url,
+                'verify' in current_url,
+                'challenge' in current_url,
+                'robot' in current_url,
+                'security' in current_url,
+                
+                # 标题指标
+                'verify' in page_title,
+                'security' in page_title,
+                'access denied' in page_title,
+                'blocked' in page_title,
+                'captcha' in page_title,
+                'human verification' in page_title,
+            ]
+            
+            # 检测页面内容指标
+            try:
+                page_source = driver.page_source.lower()
+                content_indicators = [
+                    'please verify you are human' in page_source,
+                    'captcha' in page_source,
+                    'access denied' in page_source,
+                    'blocked' in page_source,
+                    'security check' in page_source,
+                    'verify you are not a robot' in page_source,
+                    'cloudflare' in page_source and 'checking' in page_source,
+                    'just a moment' in page_source and 'verifying' in page_source,
+                ]
+                bot_indicators.extend(content_indicators)
+            except:
+                # 如果无法获取页面源码，跳过内容检测
+                pass
+            
+            # 检测特定元素
+            try:
+                # 常见的验证码或机器人检测元素
+                verification_selectors = [
+                    "[id*='captcha']",
+                    "[class*='captcha']",
+                    "[id*='challenge']",
+                    "[class*='challenge']",
+                    "[id*='verify']",
+                    "[class*='verify']",
+                    "iframe[src*='captcha']",
+                    "iframe[src*='recaptcha']",
+                ]
+                
+                for selector in verification_selectors:
+                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                    if elements:
+                        bot_indicators.append(True)
+                        break
+                        
+            except Exception:
+                # 如果元素查找失败，跳过
+                pass
+            
+            # 如果任何指标为True，则检测到机器人验证
+            detected = any(bot_indicators)
+            
+            if detected:
+                self.bot_detection_count += 1
+                logger.warning(f"🤖 检测到机器人验证！(第{self.bot_detection_count}次)")
+                logger.warning(f"   URL: {current_url}")
+                logger.warning(f"   标题: {page_title}")
+                
+                # 保存验证页面截图用于调试
+                try:
+                    timestamp = int(time.time())
+                    screenshot_path = f"bot_detection_screenshot_{timestamp}.png"
+                    driver.save_screenshot(screenshot_path)
+                    logger.info(f"📸 已保存验证页面截图: {screenshot_path}")
+                except:
+                    pass
+            
+            return detected
+            
+        except Exception as e:
+            logger.warning(f"机器人检测失败: {e}")
+            return False
+    
+    def handle_bot_detection(self):
+        """处理机器人检测触发后的算法调整"""
+        try:
+            # 启用自适应模式
+            self.adaptive_mode = True
+            
+            # 根据检测次数调整参数
+            if self.bot_detection_count == 1:
+                # 第一次检测：降低请求频率
+                self.base_delay_multiplier = 2.0
+                self.max_requests = 40  # 降低到40次
+                self.batch_delay_threshold = 20  # 每20次延时
+                logger.info("🔧 算法调整 Level 1: 延时x2, 限制40次, 每20次批次延时")
+                
+            elif self.bot_detection_count == 2:
+                # 第二次检测：进一步降低频率
+                self.base_delay_multiplier = 3.0
+                self.max_requests = 20  # 降低到20次
+                self.batch_delay_threshold = 10  # 每10次延时
+                logger.info("🔧 算法调整 Level 2: 延时x3, 限制20次, 每10次批次延时")
+                
+            elif self.bot_detection_count >= 3:
+                # 第三次及以上：极保守模式
+                self.base_delay_multiplier = 5.0
+                self.max_requests = 10  # 降低到10次
+                self.batch_delay_threshold = 5   # 每5次延时
+                logger.info("🔧 算法调整 Level 3: 延时x5, 限制10次, 每5次批次延时")
+            
+            # 立即等待一段时间
+            wait_time = 300 + (self.bot_detection_count * 120)  # 5-15分钟
+            logger.warning(f"⏳ 机器人检测触发，等待 {wait_time//60} 分钟...")
+            time.sleep(wait_time)
+            
+            # 重置请求计数
+            self.current_requests = 0
+            self.request_times.clear()
+            
+            logger.info("✅ 等待完成，算法已调整，继续执行")
+            
+        except Exception as e:
+            logger.error(f"处理机器人检测失败: {e}")
+    
+    def get_smart_delay(self) -> float:
+        """获取智能延时时间（自适应版本）"""
+        # 基础延时计算
+        if self.current_requests <= 200:
+            base_delay = random.uniform(1.5, 3.0)  # 基础延时
+        elif self.current_requests <= 400:
+            base_delay = random.uniform(3.0, 5.0)  # 中等延时
+        elif self.current_requests <= 600:
+            base_delay = random.uniform(5.0, 8.0)  # 较长延时
+        else:
+            base_delay = random.uniform(8.0, 12.0) # 临界延时
+        
+        # 应用自适应倍数
+        adjusted_delay = base_delay * self.base_delay_multiplier
+        
+        # 如果处于自适应模式，额外增加随机延时
+        if self.adaptive_mode:
+            extra_delay = random.uniform(2.0, 8.0)
+            adjusted_delay += extra_delay
+        
+        return adjusted_delay
     
     def check_and_reset(self):
         """检查请求数量并在必要时重置"""
@@ -90,7 +245,12 @@ class AntiCrawlerManager:
     def get_status(self) -> str:
         """获取当前状态信息"""
         elapsed = datetime.now() - self.start_time
-        return f"请求数: {self.current_requests}/{self.max_requests}, 运行时间: {elapsed}"
+        status = f"请求数: {self.current_requests}/{self.max_requests}, 运行时间: {elapsed}"
+        
+        if self.adaptive_mode:
+            status += f", 自适应模式: x{self.base_delay_multiplier:.1f}, 检测次数: {self.bot_detection_count}"
+        
+        return status
 
 
 class ProgressManager:
@@ -146,13 +306,13 @@ class ProgressManager:
 class EnhancedStockAnalyzer:
     """增强的股票分析器"""
     
-    def __init__(self, test_mode=True, max_stocks=5):
+    def __init__(self, test_mode=False, max_stocks=None):
         """
         初始化分析器
         
         Args:
             test_mode: 是否为测试模式
-            max_stocks: 测试模式下最大处理股票数量
+            max_stocks: 最大处理股票数量，None表示处理全部
         """
         self.test_mode = test_mode
         self.max_stocks = max_stocks
@@ -167,7 +327,10 @@ class EnhancedStockAnalyzer:
         self.my_alpha_picker_url = "https://seekingalpha.com/screeners/967f241ea593-MyAlphaPicker"
         self.quant_rating_url_template = "https://seekingalpha.com/symbol/{symbol}/ratings/quant-ratings"
         
-        logger.info(f"初始化增强股票分析器 - 测试模式: {test_mode}, 最大股票数: {max_stocks}")
+        if max_stocks is None:
+            logger.info(f"初始化增强股票分析器 - 处理模式: {'测试' if test_mode else '生产'}, 股票数: 全部")
+        else:
+            logger.info(f"初始化增强股票分析器 - 处理模式: {'测试' if test_mode else '生产'}, 最大股票数: {max_stocks}")
     
     def setup_driver(self) -> bool:
         """设置Chrome浏览器驱动"""
@@ -194,13 +357,22 @@ class EnhancedStockAnalyzer:
             
             # 等待页面加载
             logger.info("等待页面加载...")
-            time.sleep(5)
+            time.sleep(1)
             
             # 检查页面是否需要登录
             if "login" in self.driver.current_url.lower():
                 logger.warning("需要登录SeekingAlpha账户")
                 return []
             
+
+            # # 检测是否触发机器人验证
+            # if hasattr(self, 'anti_crawler') and self.anti_crawler.detect_bot_verification(self.driver):
+            #     logger.warning("🤖 MyAlphaPicker页面触发机器人验证")
+            #     self.anti_crawler.handle_bot_detection()
+            #     # 重新尝试访问
+            #     return self.extract_my_alpha_picker_data()
+            
+
             # 尝试多种方式等待页面元素
             wait = WebDriverWait(self.driver, 15)
             
@@ -225,6 +397,9 @@ class EnhancedStockAnalyzer:
             if not table_found:
                 logger.warning("未找到表格元素，尝试解析整个页面")
             
+            # 滚动加载全部股票（目标：312只）
+            self._scroll_to_load_all_stocks()
+            
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
             
             # 保存页面HTML用于调试
@@ -245,8 +420,8 @@ class EnhancedStockAnalyzer:
             logger.info(f"找到 {len(stock_rows)} 只股票")
             
             for i, row in enumerate(stock_rows):
-                if self.test_mode and i >= self.max_stocks:
-                    logger.info(f"测试模式: 仅处理前 {self.max_stocks} 只股票")
+                if self.max_stocks is not None and i >= self.max_stocks:
+                    logger.info(f"达到处理限制: 仅处理前 {self.max_stocks} 只股票")
                     break
                 
                 try:
@@ -266,6 +441,114 @@ class EnhancedStockAnalyzer:
             import traceback
             traceback.print_exc()
             return []
+    
+    def _scroll_to_load_all_stocks(self):
+        """
+        通过向下滚动加载全部股票数据（无限滚动）
+        """
+        try:
+            logger.info("🔄 开始滚动加载全部股票数据...")
+            
+            previous_stock_count = 0
+            stable_count = 0  # 连续多少次股票数量没有变化
+            max_stable_attempts = 6  # 连续6次没变化就停止
+            scroll_pause_time = 0.5  # 每次滚动后等待时间（给页面充分时间加载）
+            
+            while stable_count < max_stable_attempts:
+                # 滚动到页面底部
+                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                
+                # 等待内容加载
+                time.sleep(scroll_pause_time)
+                
+                # 获取当前股票数量
+                soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+                current_stock_count = self._count_stocks_in_page(soup)
+                
+                if current_stock_count > previous_stock_count:
+                    # 有新股票加载
+                    new_stocks = current_stock_count - previous_stock_count
+                    logger.info(f"📊 已加载 {current_stock_count} 只股票 (+{new_stocks} 新增)")
+                    previous_stock_count = current_stock_count
+                    stable_count = 0  # 重置稳定计数
+                else:
+                    # 股票数量没有变化
+                    stable_count += 1
+                    logger.info(f"🔄 滚动第 {stable_count}/{max_stable_attempts} 次，股票数量稳定在 {current_stock_count} 只")
+                    
+                    # 如果连续2次没有变化，尝试一些额外的滚动策略
+                    if stable_count >= 2:
+                        logger.info("🔧 尝试额外的滚动策略...")
+                        
+                        # 策略1: 多次小幅滚动
+                        for i in range(5):
+                            self.driver.execute_script("window.scrollBy(0, 500);")
+                            time.sleep(0.1)
+                        
+                        # # 策略2: 按键滚动
+                        # try:
+                        #     from selenium.webdriver.common.keys import Keys
+                        #     body = self.driver.find_element(By.TAG_NAME, "body")
+                        #     body.send_keys(Keys.END)
+                        #     time.sleep(1)
+                        #     body.send_keys(Keys.PAGE_DOWN)
+                        #     time.sleep(1)
+                        # except:
+                        #     pass
+                        
+                        # # 策略3: 尝试滚动表格容器
+                        # try:
+                        #     table_selectors = [
+                        #         "[data-test-id='screener-table']",
+                        #         ".screener-table", 
+                        #         "table",
+                        #         "[data-testid='screener-table']"
+                        #     ]
+                            
+                        #     for selector in table_selectors:
+                        #         try:
+                        #             element = self.driver.find_element(By.CSS_SELECTOR, selector)
+                        #             self.driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", element)
+                        #             time.sleep(1)
+                        #             break
+                        #         except:
+                        #             continue
+                        # except:
+                        #     pass
+                        
+                        # # 增加等待时间，给页面更多时间加载
+                        # time.sleep(2)
+            
+            # 最终统计
+            final_soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            final_count = self._count_stocks_in_page(final_soup)
+            logger.info(f"✅ 滚动完成，最终加载 {final_count} 只股票")
+            
+        except Exception as e:
+            logger.error(f"❌ 滚动加载股票失败: {e}")
+            import traceback
+            traceback.print_exc()
+    
+
+    
+    def _count_stocks_in_page(self, soup) -> int:
+        """
+        统计当前页面中的股票数量
+        
+        Args:
+            soup: BeautifulSoup对象
+            
+        Returns:
+            股票数量
+        """
+        try:
+            # 尝试多种方式计算股票数量
+            stock_rows = self._find_stock_rows(soup)
+            return len(stock_rows) if stock_rows else 0
+            
+        except Exception as e:
+            logger.debug(f"统计股票数量失败: {e}")
+            return 0
     
     def _find_stock_rows(self, soup):
         """查找股票行数据，使用多种方法"""
@@ -641,46 +924,15 @@ class EnhancedStockAnalyzer:
             table_selector = "table"
             wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, table_selector)))
             
-            consecutive_days = 0
-            previous_row_count = 0
-            no_change_count = 0
-            max_no_change = 3  # 减少等待次数
-            max_scroll_attempts = 20  # 最多滚动20次，避免无限滚动
-            scroll_count = 0
+            # 先滚动加载完整的180天评级历史数据
+            logger.info("开始滚动加载完整的评级历史数据...")
+            self._scroll_to_load_rating_history()
             
-            while no_change_count < max_no_change and scroll_count < max_scroll_attempts:
-                # 获取当前页面的评级数据
-                soup = BeautifulSoup(self.driver.page_source, 'html.parser')
-                current_consecutive = self._count_consecutive_strong_buy_from_table(soup)
-                
-                if current_consecutive > consecutive_days:
-                    consecutive_days = current_consecutive
-                    no_change_count = 0
-                    logger.info(f"找到连续Strong Buy {consecutive_days} 天...")
-                else:
-                    no_change_count += 1
-                
-                # 如果找到了一个变化点（非Strong Buy），说明已经找到完整的连续天数
-                if self._found_rating_change_point(soup):
-                    logger.info(f"找到评级变化点，连续Strong Buy天数确定为: {consecutive_days}")
-                    break
-                
-                # 滚动到页面底部加载更多数据
-                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(1.5)  # 减少等待时间
-                scroll_count += 1
-                
-                # 尝试查找并点击"加载更多"按钮
-                try:
-                    load_more_button = self.driver.find_element(By.XPATH, 
-                        "//button[contains(text(), 'Load') or contains(text(), 'More')]")
-                    if load_more_button.is_displayed():
-                        load_more_button.click()
-                        time.sleep(2)
-                        logger.info("点击'加载更多'按钮")
-                except:
-                    # 没有找到加载更多按钮，继续滚动
-                    pass
+            # 加载完成后，获取最终的评级数据并计算连续Strong Buy天数
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            consecutive_days = self._count_consecutive_strong_buy_from_table(soup)
+            logger.info(f"数据加载完成，计算得出连续Strong Buy天数: {consecutive_days}")
+
             
             logger.info(f"✅ {symbol} 连续Strong Buy天数: {consecutive_days}")
             return consecutive_days
@@ -689,6 +941,92 @@ class EnhancedStockAnalyzer:
             logger.error(f"❌ 计算连续Strong Buy天数失败: {e}")
             import traceback
             traceback.print_exc()
+            return 0
+    
+    def _scroll_to_load_rating_history(self):
+        """
+        滚动页面加载完整的180个交易日评级历史数据
+        """
+        try:
+            previous_row_count = 0
+            stable_count = 0
+            max_stable_attempts = 8  # 连续8次没变化就停止
+            scroll_pause_time = 0.5  # 每次滚动后等待时间
+            max_scrolls = 50  # 最多滚动50次，确保加载180天数据
+            scroll_count = 0
+            target_days = 75  # 目标加载75个交易日
+            
+            logger.info(f"开始滚动加载评级历史数据，目标: {target_days}个交易日")
+            
+            while stable_count < max_stable_attempts and scroll_count < max_scrolls:
+                # 滚动到页面底部
+                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(scroll_pause_time)
+                
+                # 检查当前数据行数
+                soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+                current_row_count = self._count_rating_rows(soup)
+                
+                if current_row_count > previous_row_count:
+                    logger.info(f"已加载 {current_row_count} 条评级记录")
+                    previous_row_count = current_row_count
+                    stable_count = 0
+                    
+                    # 如果已经加载了足够的数据，可以提前停止
+                    if current_row_count >= target_days:
+                        logger.info(f"已加载 {current_row_count} 条记录，达到目标天数")
+                        break
+                else:
+                    stable_count += 1
+                    logger.info(f"数据未增加，稳定次数: {stable_count}/{max_stable_attempts}")
+                
+                scroll_count += 1
+                
+                # 备用滚动策略：多次小幅滚动
+                if stable_count >= 3:
+                    logger.info("尝试备用滚动策略...")
+                    for i in range(3):
+                        self.driver.execute_script("window.scrollBy(0, 800);")
+                        time.sleep(0.3)
+            
+            final_count = self._count_rating_rows(BeautifulSoup(self.driver.page_source, 'html.parser'))
+            logger.info(f"滚动完成，最终加载了 {final_count} 条评级记录")
+            
+        except Exception as e:
+            logger.error(f"滚动加载评级历史失败: {e}")
+    
+    def _count_rating_rows(self, soup) -> int:
+        """
+        计算当前页面中评级历史的行数
+        
+        Args:
+            soup: BeautifulSoup对象
+            
+        Returns:
+            评级历史行数
+        """
+        try:
+            total_rows = 0
+            
+            # 查找所有表格
+            tables = soup.find_all('table')
+            
+            for table in tables:
+                rows = table.find_all('tr')
+                # 跳过表头，计算数据行
+                data_rows = 0
+                for row in rows[1:]:  # 跳过表头
+                    cells = row.find_all(['td', 'th'])
+                    if len(cells) >= 3:  # 确保有足够的列
+                        data_rows += 1
+                
+                if data_rows > total_rows:
+                    total_rows = data_rows
+            
+            return total_rows
+            
+        except Exception as e:
+            logger.error(f"计算评级行数失败: {e}")
             return 0
     
     def _count_consecutive_strong_buy_from_table(self, soup) -> int:
@@ -1085,6 +1423,22 @@ class EnhancedStockAnalyzer:
                     detailed_info = self.extract_stock_detailed_info(symbol)
                     self.anti_crawler.record_request()  # 记录详情页面访问
                     
+                    # # 检测是否触发机器人验证
+                    # if self.anti_crawler.detect_bot_verification(self.driver):
+                    #     # 处理机器人检测
+                    #     self.anti_crawler.handle_bot_detection()
+                    #     
+                    #     # 保存当前进度
+                    #     self.progress_manager.save_progress(
+                    #         list(processed_symbols), 
+                    #         complete_stocks_data, 
+                    #         self.anti_crawler.current_requests
+                    #     )
+                    #     
+                    #     # 重新尝试当前股票
+                    #     logger.info(f"🔄 重新尝试处理 {symbol}...")
+                    #     continue
+                    
                     # 合并基础信息和详细信息
                     complete_stock_data = {**stock, **detailed_info}
                     complete_stocks_data.append(complete_stock_data)
@@ -1270,7 +1624,7 @@ class EnhancedStockAnalyzer:
             logger.info("分析完成，浏览器保持打开状态")
 
 
-def main(test_mode=True, max_stocks=5):
+def main(test_mode=False, max_stocks=None):
     """主函数"""
     logger.info("🚀 启动增强股票分析器")
     
@@ -1299,5 +1653,5 @@ def main(test_mode=True, max_stocks=5):
 
 
 if __name__ == "__main__":
-    # 测试模式：仅处理前5只股票
-    main(test_mode=True, max_stocks=5)
+    # 生产模式：处理全部股票
+    main(test_mode=False, max_stocks=None)
