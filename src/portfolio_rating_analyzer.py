@@ -148,8 +148,45 @@ class PortfolioRatingAnalyzer:
             except:
                 logger.warning("未找到股票链接，继续尝试其他方法")
             
-            # 额外等待JavaScript渲染
-            time.sleep(5)
+            # 等待JavaScript渲染和页面完全加载
+            logger.info("等待页面完全加载...")
+            
+            # 检查页面状态
+            logger.info(f"当前页面URL: {self.driver.current_url}")
+            logger.info(f"页面标题: {self.driver.title}")
+            
+            # 使用显式等待来等待页面内容加载
+            logger.info("等待页面内容加载...")
+            max_wait_time = 60  # 最多等待60秒
+            start_time = time.time()
+            
+            while (time.time() - start_time) < max_wait_time:
+                # 检查页面是否有基本的内容结构
+                if self.driver.execute_script("return document.body && document.body.children.length > 5"):
+                    logger.info("页面基本结构已加载")
+                    break
+                    
+                logger.info(f"页面仍在加载中... ({int(time.time() - start_time)}s)")
+                time.sleep(5)
+            
+            # 等待额外时间让动态内容加载
+            time.sleep(10)
+            
+            # 尝试页面交互来确保数据加载
+            logger.info("尝试页面交互来触发数据加载...")
+            
+            # 滚动页面
+            try:
+                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(3)
+                self.driver.execute_script("window.scrollTo(0, 0);")
+                time.sleep(3)
+                
+                # 尝试点击页面来激活
+                self.driver.execute_script("document.body.click();")
+                time.sleep(2)
+            except Exception as e:
+                logger.warning(f"页面交互失败: {e}")
             
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
             
