@@ -8,7 +8,11 @@
       "Bash(ls:*)",
       "Bash(rm:*)",
       "Bash(chmod:*)",
-      "Bash(sed:*)"
+      "Bash(sed:*)",
+      "Bash(mkdir:*)",
+      "Bash(mv:*)",
+      "Bash(touch:*)",
+      "Bash(cp:*)"
     ],
     "deny": []
   }
