@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-简化股票分析器 - Simplified Stock Analyzer
-
 功能说明:
     1. 从SeekingAlpha MyAlphaPicker页面获取股票筛选列表
     2. 提取股票的Symbol、Price、QuantRating、Sector&Industry等基础信息
