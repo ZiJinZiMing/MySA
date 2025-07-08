@@ -102,14 +102,6 @@ df, rebalance_df = quick_analyze_portfolio(
 
 #### 其他分析功能
 ```bash
-# 获取投资组合持仓信息
-python src/get_holding_info.py
-
-# 分析顶级量化评级
-python src/parse_top_quant.py
-
-# 获取投资组合评级天数
-python src/get_hold_rating_days_in_portfolios.py
 
 # 监控MSTR/BTC溢价率
 python src/mstr_btc.py

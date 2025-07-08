@@ -79,12 +79,7 @@ debug_my_alpha_picker_*.html - 调试用HTML文件
 
 ### 基础用法
 ```bash
-# 测试模式 - 仅处理前5只股票
-python3 src/enhanced_stock_analyzer.py
 
-# 演示脚本
-python3 src/demo_enhanced_analyzer.py
-```
 
 ### Python API
 ```python

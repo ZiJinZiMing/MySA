@@ -34,20 +34,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### 主要脚本
 ```bash
-# 获取投资组合持仓信息
-python src/get_holding_info.py
-
-# 分析顶级量化评级
-python src/parse_top_quant.py
-
-# 获取投资组合持仓的评级天数
-python src/get_hold_rating_days_in_portfolios.py
 
 # 监控MSTR/BTC溢价率
 python src/mstr_btc.py
-
-# 运行增强功能测试
-python src/test_enhanced_functionality.py
 
 # 投资组合等权重再平衡分析 (NEW!)
 python src/PortfolioRebalancingCalculator.py 64139349
