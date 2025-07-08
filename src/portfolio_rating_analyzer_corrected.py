@@ -27,20 +27,9 @@ logger = logging.getLogger(__name__)
 class CorrectedPortfolioRatingAnalyzer:
     def __init__(self):
         self.driver = None
-        
-        # 基于用户投资组合截图的真实数据
-        self.target_stocks = [
-            # Hold评级股票 (2.5-3.5) - 需要分析连续Hold天数
-            {"symbol": "RCL", "rating": 3.47, "category": "Hold"},
-            {"symbol": "TWLO", "rating": 3.42, "category": "Hold"},
-            {"symbol": "MFC", "rating": 3.24, "category": "Hold"},
-            
-            # Buy评级股票 (3.5-4.5) - 需要分析连续Buy天数  
-            {"symbol": "EXE", "rating": 4.23, "category": "Buy"},
-            {"symbol": "REG", "rating": 3.93, "category": "Buy"},
-        ]
-        
+        self.portfolio_url = "https://seekingalpha.com/account/portfolio/total_view?portfolioId=64139349"
         self.base_url = "https://seekingalpha.com/symbol/{}/ratings/quant-ratings"
+        self.target_stocks = []  # 将从投资组合页面自动提取
         
     def connect_to_chrome(self) -> bool:
         """连接到远程调试模式的Chrome"""
@@ -255,10 +244,158 @@ class CorrectedPortfolioRatingAnalyzer:
             logger.error(f"计算连续天数失败: {e}")
             return 0
     
+    def extract_portfolio_hold_buy_stocks(self) -> List[Dict]:
+        """从投资组合页面提取Hold和Buy评级的股票"""
+        try:
+            logger.info("🔍 正在访问投资组合页面...")
+            self.driver.get(self.portfolio_url)
+            time.sleep(8)  # 等待页面加载
+            
+            # 检查页面状态
+            logger.info(f"当前页面URL: {self.driver.current_url}")
+            logger.info(f"页面标题: {self.driver.title}")
+            
+            # 等待页面内容加载
+            wait = WebDriverWait(self.driver, 30)
+            try:
+                wait.until(EC.presence_of_element_located((By.TAG_NAME, "table")))
+                logger.info("找到投资组合表格")
+            except:
+                logger.warning("未找到投资组合表格")
+            
+            # 解析投资组合数据
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            stocks = self._extract_portfolio_stocks_with_ratings(soup)
+            
+            return stocks
+            
+        except Exception as e:
+            logger.error(f"提取投资组合股票失败: {e}")
+            return []
+    
+    def _extract_portfolio_stocks_with_ratings(self, soup) -> List[Dict]:
+        """从投资组合页面HTML中提取股票代码和评分"""
+        try:
+            stocks = []
+            
+            # 查找包含股票数据的表格
+            tables = soup.find_all('table')
+            logger.info(f"找到 {len(tables)} 个表格")
+            
+            for table_idx, table in enumerate(tables):
+                rows = table.find_all('tr')
+                
+                if len(rows) > 5:  # 投资组合表格应该有多行数据
+                    logger.info(f"检查表格 {table_idx+1}，有 {len(rows)} 行")
+                    
+                    # 查找表头来确定列的位置
+                    header_row = rows[0] if rows else None
+                    if header_row:
+                        header_cells = header_row.find_all(['th', 'td'])
+                        header_texts = [cell.get_text().strip().lower() for cell in header_cells]
+                        
+                        # 查找关键列的索引
+                        symbol_col = None
+                        rating_col = None
+                        
+                        for i, header in enumerate(header_texts):
+                            if 'symbol' in header:
+                                symbol_col = i
+                            elif 'quant rating' in header or 'rating' in header:
+                                rating_col = i
+                        
+                        if symbol_col is not None and rating_col is not None:
+                            logger.info(f"找到投资组合表格！Symbol列:{symbol_col}, Rating列:{rating_col}")
+                            
+                            # 解析数据行
+                            for row_idx, row in enumerate(rows[1:], 1):
+                                cells = row.find_all(['td', 'th'])
+                                
+                                if len(cells) > max(symbol_col, rating_col):
+                                    symbol_cell = cells[symbol_col]
+                                    rating_cell = cells[rating_col]
+                                    
+                                    # 提取股票代码
+                                    symbol = self._extract_symbol_from_cell(symbol_cell)
+                                    
+                                    # 提取评分
+                                    rating = self._extract_rating_from_cell(rating_cell)
+                                    
+                                    if symbol and rating:
+                                        # 根据评分确定类别
+                                        category = self._determine_category(rating)
+                                        
+                                        # 只保留Hold和Buy股票
+                                        if category in ["Hold", "Buy"]:
+                                            stocks.append({
+                                                "symbol": symbol,
+                                                "rating": rating,
+                                                "category": category
+                                            })
+                                            
+                                            logger.info(f"  找到 {category} 股票: {symbol} ({rating})")
+            
+            logger.info(f"📊 从投资组合中提取到 {len(stocks)} 只Hold/Buy股票")
+            return stocks
+            
+        except Exception as e:
+            logger.error(f"解析投资组合股票失败: {e}")
+            return []
+    
+    def _extract_symbol_from_cell(self, cell) -> Optional[str]:
+        """从单元格中提取股票代码"""
+        try:
+            # 查找链接中的股票代码
+            links = cell.find_all('a', href=re.compile(r'/symbol/([A-Z]+)'))
+            if links:
+                href = links[0].get('href', '')
+                match = re.search(r'/symbol/([A-Z]+)', href)
+                if match:
+                    return match.group(1)
+            
+            # 如果没有链接，尝试直接提取文本
+            text = cell.get_text(strip=True)
+            if text and re.match(r'^[A-Z]{1,5}$', text):
+                return text
+                
+            return None
+            
+        except Exception as e:
+            logger.error(f"提取股票代码失败: {e}")
+            return None
+    
+    def _extract_rating_from_cell(self, cell) -> Optional[float]:
+        """从单元格中提取评分"""
+        try:
+            text = cell.get_text(strip=True)
+            
+            # 查找数字
+            match = re.search(r'(\d+\.?\d*)', text)
+            if match:
+                rating = float(match.group(1))
+                if 1.0 <= rating <= 5.0:  # 评分应该在1-5范围内
+                    return rating
+                    
+            return None
+            
+        except Exception as e:
+            logger.error(f"提取评分失败: {e}")
+            return None
+    
+    def _determine_category(self, rating: float) -> str:
+        """根据评分确定类别"""
+        if rating >= 4.5:
+            return "StrongBuy"
+        elif rating >= 3.5:
+            return "Buy"
+        elif rating >= 2.5:
+            return "Hold"
+        else:
+            return "Sell"
+
     def analyze_portfolio(self) -> List[Dict]:
         """分析投资组合中的目标股票"""
         logger.info("🚀 开始分析投资组合中的Hold和Buy股票")
-        logger.info(f"📊 目标股票数量: {len(self.target_stocks)}")
         
         results = []
         
@@ -268,6 +405,20 @@ class CorrectedPortfolioRatingAnalyzer:
             return []
         
         try:
+            # 首先从投资组合页面提取Hold和Buy股票
+            self.target_stocks = self.extract_portfolio_hold_buy_stocks()
+            
+            if not self.target_stocks:
+                logger.error("未能从投资组合中提取到Hold或Buy股票")
+                return []
+            
+            logger.info(f"📊 需要分析的股票数量: {len(self.target_stocks)}")
+            for stock in self.target_stocks:
+                logger.info(f"  - {stock['symbol']}: {stock['rating']} ({stock['category']})")
+            
+            logger.info("")
+            
+            # 分析每只股票的连续评级天数
             for i, stock in enumerate(self.target_stocks, 1):
                 symbol = stock["symbol"]
                 category = stock["category"]
