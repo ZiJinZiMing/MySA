@@ -7,7 +7,8 @@
       "Bash(find:*)",
       "Bash(ls:*)",
       "Bash(rm:*)",
-      "Bash(chmod:*)"
+      "Bash(chmod:*)",
+      "Bash(sed:*)"
     ],
     "deny": []
   }
