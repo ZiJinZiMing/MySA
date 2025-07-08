@@ -29,6 +29,7 @@ from bs4 import BeautifulSoup
 import re
 from datetime import datetime
 import json
+import random
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -84,8 +85,8 @@ class ProgressManager:
             logger.warning(f"清理进度文件失败: {e}")
 
 
-class SimplifiedStockAnalyzer:
-    """简化的股票分析器"""
+class StockAnalyzer:
+    """股票分析器"""
     
     def __init__(self, test_mode=False, max_stocks=None):
         """
@@ -99,6 +100,10 @@ class SimplifiedStockAnalyzer:
         self.max_stocks = max_stocks
         self.driver = None
         self.processed_count = 0
+        
+        # 反爬虫计数器
+        self.rating_page_visit_count = 0
+        self.anti_crawl_interval = 60  # 每60次访问进行反爬虫等待
         
         # 进度管理
         self.progress_manager = ProgressManager()
@@ -123,6 +128,29 @@ class SimplifiedStockAnalyzer:
         except Exception as e:
             logger.error(f"❌ Chrome连接失败: {e}")
             return False
+    
+    def _anti_crawl_wait(self):
+        """
+        反爬虫等待机制：每60次访问股票rating页面后随机等待2-5分钟
+        """
+        self.rating_page_visit_count += 1
+        
+        if self.rating_page_visit_count % self.anti_crawl_interval == 0:
+            # 随机等待2-5分钟
+            wait_seconds = random.uniform(2*60, 5*60)
+            
+            logger.info(f"🛡️ 反爬虫机制：已访问{self.rating_page_visit_count}次rating页面，随机等待{wait_seconds:.1f}秒")
+            
+            # 分段显示等待进度
+            segments = 20  # 将等待时间分成20段显示进度
+            segment_time = wait_seconds / segments
+            
+            for i in range(segments):
+                remaining_time = wait_seconds - (i * segment_time)
+                logger.info(f"⏳ 反爬虫等待中... 剩余{remaining_time:.1f}秒 ({i+1}/{segments})")
+                time.sleep(segment_time)
+            
+            logger.info(f"✅ 反爬虫等待完成，继续访问股票rating页面")
     
     def extract_my_alpha_picker_data(self) -> List[Dict]:
         """
@@ -168,7 +196,7 @@ class SimplifiedStockAnalyzer:
             if not table_found:
                 logger.warning("未找到表格元素，尝试解析整个页面")
             
-            # 滚动加载全部股票（目标：312只）
+            # 滚动加载全部股票
             self._scroll_to_load_all_stocks()
             
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
@@ -222,7 +250,7 @@ class SimplifiedStockAnalyzer:
             
             previous_stock_count = 0
             stable_count = 0  # 连续多少次股票数量没有变化
-            max_stable_attempts = 6  # 连续6次没变化就停止
+            max_stable_attempts = 4  # 连续6次没变化就停止
             scroll_pause_time = 1.0  # 每次滚动后等待时间
             
             while stable_count < max_stable_attempts:
@@ -251,9 +279,9 @@ class SimplifiedStockAnalyzer:
                     if stable_count >= 2:
                         logger.info("🔧 尝试额外的滚动策略...")
                         # 多次小幅滚动
-                        for i in range(5):
+                        for i in range(3):
                             self.driver.execute_script("window.scrollBy(0, 500);")
-                            time.sleep(0.2)
+                            time.sleep(0.3)
             
             # 最终统计
             final_soup = BeautifulSoup(self.driver.page_source, 'html.parser')
@@ -479,7 +507,7 @@ class SimplifiedStockAnalyzer:
             logger.info(f"🔍 正在访问 {symbol} 的量化评分页面...")
             
             self.driver.get(quant_url)
-            time.sleep(3)  # 简化的固定延时
+            time.sleep(1)  # 简化的固定延时
             
             # 获取连续Strong Buy评级天数
             consecutive_strong_buy_days = self._get_consecutive_strong_buy_days(symbol)
@@ -507,34 +535,17 @@ class SimplifiedStockAnalyzer:
     def _extract_exchange_info(self, soup) -> str:
         """提取交易所信息"""
         try:
-            # 查找包含交易所信息的元素
-            exchange_patterns = [
-                {'selector': 'span', 'text_contains': ['NASDAQ', 'NYSE', 'AMEX', 'OTCQX', 'OTC']},
-                {'selector': 'div[data-test-id*="exchange"]'},
-                {'selector': '.exchange-info'},
-            ]
-            
-            for pattern in exchange_patterns:
-                if 'text_contains' in pattern:
-                    elements = soup.find_all(pattern['selector'])
-                    for element in elements:
-                        text = element.get_text(strip=True).upper()
-                        for exchange in pattern['text_contains']:
-                            if exchange in text:
-                                # 特殊处理OTCQX
-                                if 'OTCQX' in text or 'OTC' in text:
-                                    return 'OTCQX'
-                                return exchange
-                else:
-                    element = soup.select_one(pattern['selector'])
-                    if element:
-                        return element.get_text(strip=True)
-            
-            # 如果没有找到，尝试从页面文本中提取
-            page_text = soup.get_text().upper()
-            for exchange in ['OTCQX', 'NASDAQ', 'NYSE', 'AMEX']:
-                if exchange in page_text:
-                    return exchange
+            # 查找symbol-description元素
+            symbol_desc = soup.find('div', {'data-test-id': 'symbol-description'})
+            if symbol_desc:
+                # 获取第一个span元素中的文本（包含交易所信息）
+                first_span = symbol_desc.find('span')
+                if first_span:
+                    exchange_text = first_span.get_text(strip=True)
+                    # 移除末尾的"|"符号
+                    exchange_text = exchange_text.replace('|', '').strip()
+
+                    return exchange_text  # 返回原始文本（已清理，保持原格式）
             
             return 'Unknown'
             
@@ -587,9 +598,9 @@ class SimplifiedStockAnalyzer:
         try:
             previous_row_count = 0
             stable_count = 0
-            max_stable_attempts = 8  # 连续8次没变化就停止
-            scroll_pause_time = 0.8  # 每次滚动后等待时间
-            max_scrolls = 50  # 最多滚动50次
+            max_stable_attempts = 5  # 连续8次没变化就停止
+            scroll_pause_time = 0.3  # 每次滚动后等待时间
+            max_scrolls = 10  # 最多滚动10次
             scroll_count = 0
             target_days = 75  # 目标加载75个交易日
             
@@ -618,13 +629,14 @@ class SimplifiedStockAnalyzer:
                     logger.info(f"数据未增加，稳定次数: {stable_count}/{max_stable_attempts}")
                 
                 scroll_count += 1
-                
-                # 备用滚动策略：多次小幅滚动
-                if stable_count >= 3:
-                    logger.info("尝试备用滚动策略...")
-                    for i in range(3):
-                        self.driver.execute_script("window.scrollBy(0, 800);")
-                        time.sleep(0.3)
+                #
+                # # 备用滚动策略：多次小幅滚动
+                # if stable_count >= 3:
+                #     logger.info("尝试备用滚动策略...")
+                #     for i in range(3):
+                #         self.driver.execute_script("window.scrollBy(0, 800);")
+                #         time.sleep(0.3)
+                #
             
             final_count = self._count_rating_rows(BeautifulSoup(self.driver.page_source, 'html.parser'))
             logger.info(f"滚动完成，最终加载了 {final_count} 条评级记录")
@@ -754,8 +766,11 @@ class SimplifiedStockAnalyzer:
                     continue
                 
                 try:
+                    # 反爬虫等待检查
+                    self._anti_crawl_wait()
+                    
                     # 简化的固定延时
-                    delay = 2.0
+                    delay = 0.5
                     logger.info(f"📊 处理 {symbol} ({len(complete_stocks_data)+1}/{len(basic_stocks_data)}) - 延时{delay:.1f}秒")
                     time.sleep(delay)
                     
@@ -787,7 +802,8 @@ class SimplifiedStockAnalyzer:
                     continue
             
             # 4. 清理进度文件
-            self.progress_manager.cleanup()
+            # 不清理进度文件
+            # self.progress_manager.cleanup()
             
             logger.info(f"✅ 完成分析，共处理 {len(complete_stocks_data)} 只股票")
             return complete_stocks_data
@@ -885,7 +901,7 @@ def main(test_mode=False, max_stocks=None):
     """主函数"""
     logger.info("🚀 启动简化股票分析器")
     
-    analyzer = SimplifiedStockAnalyzer(test_mode=test_mode, max_stocks=max_stocks)
+    analyzer = StockAnalyzer(test_mode=test_mode, max_stocks=max_stocks)
     
     try:
         # 执行股票分析

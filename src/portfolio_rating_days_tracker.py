@@ -244,12 +244,12 @@ class CorrectedPortfolioRatingAnalyzer:
             logger.error(f"计算连续天数失败: {e}")
             return 0
     
-    def extract_portfolio_hold_buy_stocks(self) -> List[Dict]:
+    def extract_portfolio_stocks(self) -> List[Dict]:
         """从投资组合页面提取Hold和Buy评级的股票"""
         try:
             logger.info("🔍 正在访问投资组合页面...")
             self.driver.get(self.portfolio_url)
-            time.sleep(8)  # 等待页面加载
+            time.sleep(4)  # 等待页面加载
             
             # 检查页面状态
             logger.info(f"当前页面URL: {self.driver.current_url}")
@@ -325,17 +325,15 @@ class CorrectedPortfolioRatingAnalyzer:
                                         # 根据评分确定类别
                                         category = self._determine_category(rating)
                                         
-                                        # 只保留Hold和Buy股票
-                                        if category in ["Hold", "Buy"]:
-                                            stocks.append({
-                                                "symbol": symbol,
-                                                "rating": rating,
-                                                "category": category
-                                            })
+                                        stocks.append({
+                                            "symbol": symbol,
+                                            "rating": rating,
+                                            "category": category
+                                        })
                                             
-                                            logger.info(f"  找到 {category} 股票: {symbol} ({rating})")
+                                        logger.info(f"  找到 {category} 股票: {symbol} ({rating})")
             
-            logger.info(f"📊 从投资组合中提取到 {len(stocks)} 只Hold/Buy股票")
+            logger.info(f"📊 从投资组合中提取到 {len(stocks)} 只股票")
             return stocks
             
         except Exception as e:
@@ -405,11 +403,11 @@ class CorrectedPortfolioRatingAnalyzer:
             return []
         
         try:
-            # 首先从投资组合页面提取Hold和Buy股票
-            self.target_stocks = self.extract_portfolio_hold_buy_stocks()
+            # 首先从投资组合页面提取股票
+            self.target_stocks = self.extract_portfolio_stocks()
             
             if not self.target_stocks:
-                logger.error("未能从投资组合中提取到Hold或Buy股票")
+                logger.error("未能从投资组合中提取到股票")
                 return []
             
             logger.info(f"📊 需要分析的股票数量: {len(self.target_stocks)}")
@@ -434,7 +432,7 @@ class CorrectedPortfolioRatingAnalyzer:
                 
                 # 延时避免请求过快
                 if i < len(self.target_stocks):
-                    delay = 2.0
+                    delay = 1
                     logger.info(f"⏱️ 延时 {delay}秒...")
                     time.sleep(delay)
             
