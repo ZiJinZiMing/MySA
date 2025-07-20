@@ -802,8 +802,7 @@ class StockAnalyzer:
                     continue
             
             # 4. 清理进度文件
-            # 不清理进度文件
-            # self.progress_manager.cleanup()
+            self.progress_manager.cleanup()
             
             logger.info(f"✅ 完成分析，共处理 {len(complete_stocks_data)} 只股票")
             return complete_stocks_data
