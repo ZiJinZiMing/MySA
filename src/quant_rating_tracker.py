@@ -88,13 +88,15 @@ class ProgressManager:
 class StockAnalyzer:
     """股票分析器"""
     
-    def __init__(self, test_mode=False, max_stocks=None):
+    def __init__(self, test_mode=False, max_stocks=None, screener_url=None, screener_name=None):
         """
         初始化分析器
         
         Args:
             test_mode: 是否为测试模式
             max_stocks: 最大处理股票数量，None表示处理全部
+            screener_url: 筛选器URL
+            screener_name: 筛选器名称
         """
         self.test_mode = test_mode
         self.max_stocks = max_stocks
@@ -109,24 +111,54 @@ class StockAnalyzer:
         self.progress_manager = ProgressManager()
         
         # URL配置
-        self.my_alpha_picker_url = "https://seekingalpha.com/screeners/967f241ea593-MyAlphaPicker"
+        self.my_alpha_picker_url = screener_url or "https://seekingalpha.com/screeners/967f241ea593-MyQuantAll"
+        self.screener_name = screener_name or "MyQuantAll"
         self.quant_rating_url_template = "https://seekingalpha.com/symbol/{symbol}/ratings/quant-ratings"
         
         if max_stocks is None:
-            logger.info(f"初始化简化股票分析器 - 处理模式: {'测试' if test_mode else '生产'}, 股票数: 全部")
+            logger.info(f"初始化简化股票分析器 - 筛选器: {self.screener_name}, 处理模式: {'测试' if test_mode else '生产'}, 股票数: 全部")
         else:
-            logger.info(f"初始化简化股票分析器 - 处理模式: {'测试' if test_mode else '生产'}, 最大股票数: {max_stocks}")
+            logger.info(f"初始化简化股票分析器 - 筛选器: {self.screener_name}, 处理模式: {'测试' if test_mode else '生产'}, 最大股票数: {max_stocks}")
     
     def setup_driver(self) -> bool:
         """设置Chrome浏览器驱动"""
         try:
             chrome_options = Options()
             chrome_options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+            
+            # 首先测试是否能连接到Chrome调试端口
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            result = sock.connect_ex(('127.0.0.1', 9222))
+            sock.close()
+            
+            if result != 0:
+                logger.error("❌ 无法连接到Chrome调试端口9222")
+                logger.info("请确保Chrome已启动并开启远程调试模式:")
+                logger.info("Linux/Mac: google-chrome --remote-debugging-port=9222")
+                logger.info("Windows: chrome.exe --remote-debugging-port=9222")
+                return False
+            
+            logger.info("✅ Chrome调试端口9222已开启，尝试连接...")
+            
+            # 尝试连接Chrome
             self.driver = webdriver.Chrome(options=chrome_options)
             logger.info("✅ Chrome远程调试连接成功")
             return True
+            
         except Exception as e:
             logger.error(f"❌ Chrome连接失败: {e}")
+            logger.info("详细错误信息:")
+            import traceback
+            traceback.print_exc()
+            
+            # 提供更多帮助信息
+            logger.info("\n可能的解决方案:")
+            logger.info("1. 确保已安装Chrome浏览器和ChromeDriver")
+            logger.info("2. 确保Chrome正在以远程调试模式运行")
+            logger.info("3. 检查ChromeDriver版本是否与Chrome版本匹配")
+            logger.info("4. 尝试关闭所有Chrome实例后重新启动")
+            
             return False
     
     def _anti_crawl_wait(self):
@@ -160,7 +192,7 @@ class StockAnalyzer:
             包含股票基础信息的列表
         """
         try:
-            logger.info("🔍 正在访问MyAlphaPicker页面...")
+            logger.info(f"🔍 正在访问{self.screener_name}页面...")
             self.driver.get(self.my_alpha_picker_url)
             
             # 等待页面加载
@@ -900,7 +932,41 @@ def main(test_mode=False, max_stocks=None):
     """主函数"""
     logger.info("🚀 启动简化股票分析器")
     
-    analyzer = StockAnalyzer(test_mode=test_mode, max_stocks=max_stocks)
+    # 定义可选的筛选器
+    screeners = {
+        "1": {
+            "name": "MyQuantAll",
+            "url": "https://seekingalpha.com/screeners/967f241ea593-MyQuantAll"
+        },
+        "2": {
+            "name": "MyQuantLargeCap",
+            "url": "https://seekingalpha.com/screeners/967141c6704b-MyQuantLargeCap"
+        }
+    }
+    
+    # 显示选项
+    print("\n请选择要使用的筛选器:")
+    print("1. MyQuantAll (所有股票)")
+    print("2. MyQuantLargeCap (大盘股)")
+    
+    # 获取用户选择
+    while True:
+        choice = input("\n请输入选择 (1 或 2): ").strip()
+        if choice in screeners:
+            selected_screener = screeners[choice]
+            break
+        else:
+            print("无效选择，请输入 1 或 2")
+    
+    logger.info(f"已选择筛选器: {selected_screener['name']}")
+    
+    # 创建分析器实例
+    analyzer = StockAnalyzer(
+        test_mode=test_mode, 
+        max_stocks=max_stocks,
+        screener_url=selected_screener['url'],
+        screener_name=selected_screener['name']
+    )
     
     try:
         # 执行股票分析
@@ -909,7 +975,8 @@ def main(test_mode=False, max_stocks=None):
         # 保存结果
         if stocks_data:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            filename = f"my_alpha_picker_analysis_simplified_{timestamp}.csv"
+            # 在文件名中包含筛选器名称
+            filename = f"top_quant_{selected_screener['name']}_{timestamp}.csv"
             analyzer.save_results_to_csv(stocks_data, filename)
         else:
             logger.warning("未获取到任何股票数据")
