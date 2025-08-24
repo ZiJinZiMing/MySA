@@ -481,692 +481,130 @@ class FixedSeekingAlphaScraper:
             logger.error(f"保存调试信息失败: {e}")
 
     
-    def calculate_equal_weight_rebalance(self, portfolio_df, config=None):
+    def calculate_equal_weight_rebalance(self, portfolio_df, min_trade_amount=None, cash_reserve_amount=None):
         """
-        计算等权重再平衡策略（分层处理策略）
+        简化等权重再平衡算法
         
         Args:
             portfolio_df: 投资组合DataFrame
-            config: 配置字典，包含所有再平衡参数
-            
+            min_trade_amount: 最小交易金额
+            cash_reserve_amount: 预留现金金额（绝对值）
+        
         Returns:
             再平衡指令DataFrame
         """
         try:
-            # 使用默认配置
-            if config is None:
-                config = self.get_default_config()
+            # 获取默认配置
+            config = self.get_simple_config()
+            if min_trade_amount is None:
+                min_trade_amount = config['min_trade_amount']
+            if cash_reserve_amount is None:
+                cash_reserve_amount = config['cash_reserve_amount']
             
-            logger.info("开始计算等权重再平衡策略（分层处理策略）")
+            logger.info("开始计算简化等权重再平衡策略")
+            logger.info(f"配置参数: 最小交易金额=${min_trade_amount}, 预留现金=${cash_reserve_amount}")
             
             if portfolio_df is None or portfolio_df.empty:
                 logger.error("投资组合数据为空")
                 return None
             
-            # 初始化参数
-            exclude_symbols = config.get('exclude_symbols', [])
-            liquidate_symbols = config.get('liquidate_symbols', [])
-            
-            # ===== 第一阶段：基础数据准备 =====
+            # 1. 分离现金和股票数据
             cash_rows = portfolio_df[portfolio_df['symbol'] == 'CASH']
-            stock_rows = portfolio_df[portfolio_df['symbol'] != 'CASH'].copy()
+            stocks_df = portfolio_df[portfolio_df['symbol'] != 'CASH'].copy()
             
+            if stocks_df.empty:
+                logger.warning("没有股票数据")
+                return None
+            
+            # 2. 计算总投资金额（包含现金管理）
             total_portfolio_value = portfolio_df['value'].sum()
             available_cash = cash_rows['value'].sum() if not cash_rows.empty else 0
+            current_stock_value = stocks_df['value'].sum()
+            
+            # 总投资金额 = 投资组合总价值 - 预留现金
+            total_investment_amount = total_portfolio_value - cash_reserve_amount
             
             logger.info(f"📊 投资组合总价值: ${total_portfolio_value:,.2f}")
             logger.info(f"💰 当前现金: ${available_cash:,.2f}")
+            logger.info(f"📈 当前股票价值: ${current_stock_value:,.2f}")
+            logger.info(f"🏦 预留现金: ${cash_reserve_amount:,.2f}")
+            logger.info(f"🎯 总投资金额: ${total_investment_amount:,.2f}")
+            logger.info(f"📊 股票数量: {len(stocks_df)}")
             
-            # ===== 第二阶段：处理清仓和排除 =====
-            liquidation_proceeds = 0
-            liquidated_stocks = pd.DataFrame()
-            if liquidate_symbols:
-                liquidation_mask = stock_rows['symbol'].isin(liquidate_symbols)
-                liquidated_stocks = stock_rows[liquidation_mask].copy()
-                liquidation_proceeds = liquidated_stocks['value'].sum()
-                stock_rows = stock_rows[~liquidation_mask]
-                logger.info(f"🔥 清仓股票: {liquidate_symbols}")
-                logger.info(f"🔥 清仓获得资金: ${liquidation_proceeds:,.2f}")
+            # 3. 等权重计算：每只股票目标金额
+            stock_count = len(stocks_df)
+            target_amount_per_stock = total_investment_amount / stock_count
             
-            if exclude_symbols:
-                exclude_mask = stock_rows['symbol'].isin(exclude_symbols)
-                stock_rows = stock_rows[~exclude_mask]
-                logger.info(f"⏭️ 排除股票: {exclude_symbols}")
+            logger.info(f"💰 每股目标金额: ${target_amount_per_stock:,.2f}")
             
-            # ===== 第三阶段：计算目标股票数量 =====
-            # 根据实际数据计算目标股票数量，而不是使用配置参数
-            target_stock_count = len(stock_rows)
-            logger.info(f"🎯 目标股票数量: {target_stock_count} (根据实际数据计算)")
+            # 4. 计算每只股票的目标持股数（向上取整）
+            stocks_df['target_shares'] = np.ceil(target_amount_per_stock / stocks_df['price'])
+            stocks_df['target_value'] = stocks_df['target_shares'] * stocks_df['price']
             
-            # ===== 第四阶段：计算预留现金 =====
-            target_cash_reserve = self._calculate_target_cash_reserve(total_portfolio_value, config)
-            logger.info(f"🏦 预留现金: ${target_cash_reserve:,.2f}")
+            # 5. 生成买卖指令
+            trades = []
+            total_buy_amount = 0
+            total_sell_amount = 0
             
-            # ===== 第五阶段：分层处理再平衡 =====
-            total_available_funds = available_cash + liquidation_proceeds - target_cash_reserve
-            
-            if total_available_funds <= 0:
-                logger.warning("⚠️ 可用资金不足，无法进行再平衡")
-                return self._create_liquidation_only_df(liquidated_stocks) if not liquidated_stocks.empty else None
-            
-            # 计算目标权重和偏离度
-            target_weight = 1.0 / target_stock_count
-            target_value_per_stock = total_portfolio_value * target_weight
-            
-            stock_rows['target_value'] = target_value_per_stock
-            stock_rows['deviation'] = (stock_rows['value'] - target_value_per_stock) / total_portfolio_value
-            stock_rows['abs_deviation'] = abs(stock_rows['deviation'])
-            
-            # 执行分层处理
-            trades, remaining_funds = self._execute_tiered_rebalancing(
-                stock_rows, total_available_funds, target_value_per_stock, 
-                total_portfolio_value, config
-            )
-            
-            # 添加清仓指令
-            if not liquidated_stocks.empty:
-                for _, stock in liquidated_stocks.iterrows():
+            for _, stock in stocks_df.iterrows():
+                current_shares = int(stock['shares'])
+                target_shares = int(stock['target_shares'])
+                share_diff = target_shares - current_shares
+                trade_amount = abs(share_diff) * stock['price']
+                
+                # 只处理交易金额大于最小交易金额的操作
+                if trade_amount >= min_trade_amount:
+                    action = 'BUY' if share_diff > 0 else 'SELL'
+                    
                     trades.append({
                         'symbol': stock['symbol'],
-                        'action': 'LIQUIDATE',
-                        'shares': int(stock['shares']),
+                        'action': action,
+                        'shares': abs(share_diff),
                         'price': stock['price'],
-                        'amount': stock['value'],
+                        'amount': trade_amount,
+                        'current_shares': current_shares,
+                        'target_shares': target_shares,
                         'current_value': stock['value'],
-                        'target_value': 0,
-                        'difference': -stock['value'],
-                        'current_weight': stock['value'] / total_portfolio_value,
-                        'target_weight': 0,
-                        'priority': 'LIQUIDATION',
-                        'reason': '清仓'
+                        'target_value': stock['target_value'],
+                        'reason': f'等权重调整 (${stock["value"]:.0f} → ${stock["target_value"]:.0f})'
                     })
+                    
+                    if action == 'BUY':
+                        total_buy_amount += trade_amount
+                    else:
+                        total_sell_amount += trade_amount
+                    
+                    logger.info(f"  📈 {stock['symbol']}: {action} {abs(share_diff)} 股，${trade_amount:,.2f}")
             
             if not trades:
                 logger.info("✅ 投资组合已接近等权重，无需再平衡")
                 return None
             
-            # 生成最终报告
-            self._log_rebalancing_summary(trades, total_available_funds, remaining_funds)
+            # 生成摘要
+            logger.info(f"\n💰 === 简化等权重再平衡摘要 ===")
+            logger.info(f"买入交易: {len([t for t in trades if t['action'] == 'BUY'])} 笔，总计 ${total_buy_amount:,.2f}")
+            logger.info(f"卖出交易: {len([t for t in trades if t['action'] == 'SELL'])} 笔，总计 ${total_sell_amount:,.2f}")
+            logger.info(f"净资金需求: ${total_buy_amount - total_sell_amount:,.2f}")
             
             return pd.DataFrame(trades)
             
         except Exception as e:
-            logger.error(f"计算等权重再平衡失败: {e}")
+            logger.error(f"计算简化等权重再平衡失败: {e}")
             return None
     
-    def get_default_config(self):
+    def get_simple_config(self):
         """
-        获取默认配置参数
+        获取简化配置参数（仅适用于简化等权重算法）
         
         Returns:
-            dict: 默认配置字典
+            dict: 简化配置字典
         """
         return {
-            # 基础配置
-            'target_stock_count': 30,                  # 目标股票数量
-            'exclude_symbols': ['CASH'],               # 排除的股票代码
-            'liquidate_symbols': [],                   # 需要清仓的股票代码
-            
-            # 现金管理
-            'target_cash_amount': None,                # 目标固定现金金额 (优先级高)
-            'target_cash_percentage': 0.02,            # 目标现金比例 (2%)
-            'min_cash_reserve': 1000,                  # 最小现金储备
-            
-            # 偏离度阈值
-            'deviation_thresholds': {
-                'critical': 0.02,                      # 临界偏离 (2%)
-                'severe': 0.015,                       # 严重偏离 (1.5%)
-                'moderate': 0.01,                      # 中等偏离 (1%)
-                'minor': 0.005,                        # 轻微偏离 (0.5%)
-                'target_range': 0.003                  # 目标范围 (±0.3%)
-            },
-            
-            # 分层处理配置
-            'tier_allocation': {
-                'tier1_budget_ratio': 0.6,             # 第一层预算比例 (60%)
-                'tier2_budget_ratio': 0.3,             # 第二层预算比例 (30%)
-                'tier3_budget_ratio': 0.1,             # 第三层预算比例 (10%)
-                'max_single_stock_ratio': 0.15,        # 单只股票最大资金比例 (15%)
-                'tier1_target_improvement': 0.7,       # 第一层目标改善比例 (70%)
-                'tier2_target_improvement': 0.5,       # 第二层目标改善比例 (50%)
-                'tier3_target_improvement': 0.3        # 第三层目标改善比例 (30%)
-            },
-            
-            # 交易约束
-            'trading_constraints': {
-                'min_trade_amount': 100,               # 最小交易金额
-                'min_shares_per_trade': 1,             # 最小交易股数
-                'max_position_change': 0.5,            # 单次最大仓位变化 (50%)
-                'overweight_sell_threshold': 0.015,    # 超配卖出阈值 (1.5%)
-                'underweight_buy_threshold': -0.005    # 低配买入阈值 (-0.5%)
-            },
-            
-            # 风险控制
-            'risk_management': {
-                'max_trades_per_session': 50,          # 单次最大交易数
-                'emergency_cash_ratio': 0.05,          # 紧急现金比例 (5%)
-                'concentration_limit': 0.1,            # 单只股票最大权重 (10%)
-                'liquidity_buffer': 0.02               # 流动性缓冲 (2%)
-            }
+            'min_trade_amount': 100,                   # 最小交易金额
+            'cash_reserve_amount': 0,                  # 预留现金金额（绝对值）
         }
     
-    def _calculate_target_cash_reserve(self, total_portfolio_value, config):
-        """
-        计算目标现金储备
-        
-        Args:
-            total_portfolio_value: 投资组合总价值
-            config: 配置字典
-            
-        Returns:
-            float: 目标现金储备金额
-        """
-        target_cash_amount = config.get('target_cash_amount')
-        if target_cash_amount is not None:
-            return target_cash_amount
-        
-        target_cash_percentage = config.get('target_cash_percentage', 0.02)
-        calculated_reserve = total_portfolio_value * target_cash_percentage
-        
-        min_cash_reserve = config.get('min_cash_reserve', 1000)
-        return max(calculated_reserve, min_cash_reserve)
-    
-    def _execute_tiered_rebalancing(self, stock_rows, available_funds, target_value_per_stock, 
-                                   total_portfolio_value, config):
-        """
-        执行分层再平衡策略
-        
-        Args:
-            stock_rows: 股票数据DataFrame
-            available_funds: 可用资金
-            target_value_per_stock: 目标每股价值
-            total_portfolio_value: 投资组合总价值
-            config: 配置字典
-            
-        Returns:
-            tuple: (交易列表, 剩余资金)
-        """
-        trades = []
-        remaining_funds = available_funds
-        
-        # 获取配置
-        thresholds = config.get('deviation_thresholds')
-        tier_config = config.get('tier_allocation')
-        
-        # 第一步：处理超配股票，增加可用资金
-        overweight_proceeds = self._handle_overweight_stocks(
-            stock_rows, target_value_per_stock, total_portfolio_value, 
-            thresholds, config, trades
-        )
-        remaining_funds += overweight_proceeds
-        
-        logger.info(f"💰 超配卖出获得资金: ${overweight_proceeds:,.2f}")
-        logger.info(f"💰 更新后可用资金: ${remaining_funds:,.2f}")
-        
-        # 第二步：分层处理不足权重的股票
-        underweight_stocks = stock_rows[stock_rows['deviation'] < -thresholds['minor']].copy()
-        
-        if underweight_stocks.empty:
-            logger.info("✅ 没有需要补仓的股票")
-            return trades, remaining_funds
-        
-        # 计算资金覆盖率
-        total_shortage = (underweight_stocks['target_value'] - underweight_stocks['value']).sum()
-        coverage_ratio = remaining_funds / total_shortage if total_shortage > 0 else 1.0
-        
-        logger.info(f"📊 === 分层处理分析 ===")
-        logger.info(f"不足权重股票数量: {len(underweight_stocks)}")
-        logger.info(f"总资金缺口: ${total_shortage:,.2f}")
-        logger.info(f"资金覆盖率: {coverage_ratio:.2%}")
-        
-        # 执行分层处理
-        if coverage_ratio < 0.2:
-            logger.info("🚨 策略：集中火力解决最严重问题")
-            remaining_funds = self._tier1_critical_focus(
-                underweight_stocks, remaining_funds, target_value_per_stock, 
-                total_portfolio_value, config, trades
-            )
-        elif coverage_ratio < 0.6:
-            logger.info("⚠️ 策略：分层处理不同程度的不足")
-            remaining_funds = self._execute_full_tiered_strategy(
-                underweight_stocks, remaining_funds, target_value_per_stock, 
-                total_portfolio_value, config, trades
-            )
-        else:
-            logger.info("✅ 策略：全面改善权重平衡")
-            remaining_funds = self._comprehensive_rebalancing(
-                underweight_stocks, remaining_funds, target_value_per_stock, 
-                total_portfolio_value, config, trades
-            )
-        
-        return trades, remaining_funds
-    
-    def _handle_overweight_stocks(self, stock_rows, target_value_per_stock, total_portfolio_value, 
-                                 thresholds, config, trades):
-        """
-        处理超配股票，通过卖出增加可用资金
-        
-        Args:
-            stock_rows: 股票数据DataFrame
-            target_value_per_stock: 目标每股价值
-            total_portfolio_value: 投资组合总价值
-            thresholds: 偏离度阈值
-            config: 配置字典
-            trades: 交易列表
-            
-        Returns:
-            float: 卖出获得的资金
-        """
-        sell_threshold = config.get('trading_constraints', {}).get('overweight_sell_threshold', 0.015)
-        overweight_stocks = stock_rows[stock_rows['deviation'] > sell_threshold]
-        
-        total_proceeds = 0
-        
-        if overweight_stocks.empty:
-            return total_proceeds
-        
-        logger.info(f"🔍 发现 {len(overweight_stocks)} 只超配股票")
-        
-        for _, stock in overweight_stocks.iterrows():
-            excess_value = stock['value'] - target_value_per_stock
-            shares_to_sell = int(excess_value / stock['price'])
-            
-            if shares_to_sell > 0:
-                sell_amount = shares_to_sell * stock['price']
-                
-                trades.append({
-                    'symbol': stock['symbol'],
-                    'action': 'SELL',
-                    'shares': shares_to_sell,
-                    'price': stock['price'],
-                    'amount': sell_amount,
-                    'current_value': stock['value'],
-                    'target_value': target_value_per_stock,
-                    'difference': -excess_value,
-                    'current_weight': stock['value'] / total_portfolio_value,
-                    'target_weight': target_value_per_stock / total_portfolio_value,
-                    'priority': 'OVERWEIGHT_REDUCTION',
-                    'reason': f'超配{stock["deviation"]:.2%}'
-                })
-                
-                total_proceeds += sell_amount
-                logger.info(f"  📉 {stock['symbol']}: 卖出 {shares_to_sell} 股，获得 ${sell_amount:,.2f}")
-        
-        return total_proceeds
-    
-    def _tier1_critical_focus(self, underweight_stocks, available_funds, target_value_per_stock, 
-                             total_portfolio_value, config, trades):
-        """
-        第一层：集中处理最严重的问题
-        
-        Args:
-            underweight_stocks: 不足权重股票DataFrame
-            available_funds: 可用资金
-            target_value_per_stock: 目标每股价值
-            total_portfolio_value: 投资组合总价值
-            config: 配置字典
-            trades: 交易列表
-            
-        Returns:
-            float: 剩余资金
-        """
-        thresholds = config.get('deviation_thresholds')
-        tier_config = config.get('tier_allocation')
-        
-        # 只处理最严重的前5只股票
-        critical_stocks = underweight_stocks[
-            underweight_stocks['deviation'] < -thresholds['critical']
-        ].sort_values('deviation').head(5)
-        
-        remaining_funds = available_funds
-        
-        logger.info(f"🎯 第一层：集中处理 {len(critical_stocks)} 只最严重股票")
-        
-        for _, stock in critical_stocks.iterrows():
-            if remaining_funds < stock['price']:
-                break
-            
-            # 目标：让这只股票达到可接受的水平
-            target_improvement = tier_config.get('tier1_target_improvement', 0.7)
-            needed_improvement = (target_value_per_stock - stock['value']) * target_improvement
-            
-            max_investment = min(
-                needed_improvement,
-                remaining_funds * 0.8,  # 最多用80%资金
-                remaining_funds - config.get('min_cash_reserve', 1000)
-            )
-            
-            if max_investment > stock['price']:
-                shares = int(max_investment / stock['price'])
-                cost = shares * stock['price']
-                
-                trades.append({
-                    'symbol': stock['symbol'],
-                    'action': 'BUY',
-                    'shares': shares,
-                    'price': stock['price'],
-                    'amount': cost,
-                    'current_value': stock['value'],
-                    'target_value': target_value_per_stock,
-                    'difference': target_value_per_stock - stock['value'],
-                    'current_weight': stock['value'] / total_portfolio_value,
-                    'target_weight': target_value_per_stock / total_portfolio_value,
-                    'priority': 'TIER1_CRITICAL',
-                    'reason': f'严重不足{stock["deviation"]:.2%}'
-                })
-                
-                remaining_funds -= cost
-                logger.info(f"  🎯 {stock['symbol']}: 集中投资 {shares} 股，${cost:,.2f}")
-        
-        return remaining_funds
-    
-    def _execute_full_tiered_strategy(self, underweight_stocks, available_funds, target_value_per_stock, 
-                                     total_portfolio_value, config, trades):
-        """
-        执行完整的分层策略
-        
-        Args:
-            underweight_stocks: 不足权重股票DataFrame
-            available_funds: 可用资金
-            target_value_per_stock: 目标每股价值
-            total_portfolio_value: 投资组合总价值
-            config: 配置字典
-            trades: 交易列表
-            
-        Returns:
-            float: 剩余资金
-        """
-        thresholds = config.get('deviation_thresholds')
-        tier_config = config.get('tier_allocation')
-        
-        # 股票分层
-        tier1_stocks = underweight_stocks[underweight_stocks['deviation'] < -thresholds['critical']]
-        tier2_stocks = underweight_stocks[
-            (underweight_stocks['deviation'] >= -thresholds['critical']) &
-            (underweight_stocks['deviation'] < -thresholds['severe'])
-        ]
-        tier3_stocks = underweight_stocks[
-            (underweight_stocks['deviation'] >= -thresholds['severe']) &
-            (underweight_stocks['deviation'] < -thresholds['minor'])
-        ]
-        
-        remaining_funds = available_funds
-        
-        # 第一层：临界不足股票 (60%资金)
-        tier1_budget = available_funds * tier_config.get('tier1_budget_ratio', 0.6)
-        remaining_funds = self._process_tier1_stocks(
-            tier1_stocks, tier1_budget, remaining_funds, target_value_per_stock, 
-            total_portfolio_value, config, trades
-        )
-        
-        # 第二层：严重不足股票 (30%资金)
-        tier2_budget = min(
-            available_funds * tier_config.get('tier2_budget_ratio', 0.3),
-            remaining_funds
-        )
-        remaining_funds = self._process_tier2_stocks(
-            tier2_stocks, tier2_budget, remaining_funds, target_value_per_stock, 
-            total_portfolio_value, config, trades
-        )
-        
-        # 第三层：中等不足股票 (剩余资金)
-        remaining_funds = self._process_tier3_stocks(
-            tier3_stocks, remaining_funds, target_value_per_stock, 
-            total_portfolio_value, config, trades
-        )
-        
-        return remaining_funds
-    
-    def _process_tier1_stocks(self, tier1_stocks, tier1_budget, remaining_funds, target_value_per_stock, 
-                             total_portfolio_value, config, trades):
-        """
-        处理第一层股票：临界不足股票
-        """
-        if tier1_stocks.empty:
-            return remaining_funds
-        
-        tier_config = config.get('tier_allocation')
-        logger.info(f"🎯 第一层处理：{len(tier1_stocks)} 只临界不足股票，预算 ${tier1_budget:,.2f}")
-        
-        for _, stock in tier1_stocks.sort_values('deviation').iterrows():
-            if remaining_funds < stock['price'] or tier1_budget < stock['price']:
-                break
-            
-            # 目标：让这些股票达到严重不足水平
-            target_improvement = tier_config.get('tier1_target_improvement', 0.7)
-            needed_improvement = (target_value_per_stock - stock['value']) * target_improvement
-            
-            max_investment = min(
-                needed_improvement,
-                tier1_budget / max(1, len(tier1_stocks)),
-                remaining_funds * tier_config.get('max_single_stock_ratio', 0.15)
-            )
-            
-            if max_investment > stock['price']:
-                shares = int(max_investment / stock['price'])
-                cost = shares * stock['price']
-                
-                trades.append({
-                    'symbol': stock['symbol'],
-                    'action': 'BUY',
-                    'shares': shares,
-                    'price': stock['price'],
-                    'amount': cost,
-                    'current_value': stock['value'],
-                    'target_value': target_value_per_stock,
-                    'difference': target_value_per_stock - stock['value'],
-                    'current_weight': stock['value'] / total_portfolio_value,
-                    'target_weight': target_value_per_stock / total_portfolio_value,
-                    'priority': 'TIER1_CRITICAL',
-                    'reason': f'临界不足{stock["deviation"]:.2%}'
-                })
-                
-                remaining_funds -= cost
-                tier1_budget -= cost
-                
-                new_deviation = (stock['value'] + cost - target_value_per_stock) / total_portfolio_value
-                logger.info(f"  📈 {stock['symbol']}: 买入 {shares} 股 (${cost:,.2f}), "
-                           f"改善 {stock['deviation']:.2%} → {new_deviation:.2%}")
-        
-        return remaining_funds
-    
-    def _process_tier2_stocks(self, tier2_stocks, tier2_budget, remaining_funds, target_value_per_stock, 
-                             total_portfolio_value, config, trades):
-        """
-        处理第二层股票：严重不足股票
-        """
-        if tier2_stocks.empty:
-            return remaining_funds
-        
-        tier_config = config.get('tier_allocation')
-        logger.info(f"🎯 第二层处理：{len(tier2_stocks)} 只严重不足股票，预算 ${tier2_budget:,.2f}")
-        
-        for _, stock in tier2_stocks.sort_values('deviation').iterrows():
-            if remaining_funds < stock['price'] or tier2_budget < stock['price']:
-                break
-            
-            target_improvement = tier_config.get('tier2_target_improvement', 0.5)
-            needed_improvement = (target_value_per_stock - stock['value']) * target_improvement
-            
-            max_investment = min(
-                needed_improvement,
-                tier2_budget / max(1, len(tier2_stocks)),
-                remaining_funds * 0.1  # 第二层单股最多10%资金
-            )
-            
-            if max_investment > stock['price']:
-                shares = int(max_investment / stock['price'])
-                cost = shares * stock['price']
-                
-                trades.append({
-                    'symbol': stock['symbol'],
-                    'action': 'BUY',
-                    'shares': shares,
-                    'price': stock['price'],
-                    'amount': cost,
-                    'current_value': stock['value'],
-                    'target_value': target_value_per_stock,
-                    'difference': target_value_per_stock - stock['value'],
-                    'current_weight': stock['value'] / total_portfolio_value,
-                    'target_weight': target_value_per_stock / total_portfolio_value,
-                    'priority': 'TIER2_SEVERE',
-                    'reason': f'严重不足{stock["deviation"]:.2%}'
-                })
-                
-                remaining_funds -= cost
-                tier2_budget -= cost
-                logger.info(f"  📈 {stock['symbol']}: 买入 {shares} 股 (${cost:,.2f})")
-        
-        return remaining_funds
-    
-    def _process_tier3_stocks(self, tier3_stocks, remaining_funds, target_value_per_stock, 
-                             total_portfolio_value, config, trades):
-        """
-        处理第三层股票：中等不足股票
-        """
-        if tier3_stocks.empty:
-            return remaining_funds
-        
-        tier_config = config.get('tier_allocation')
-        logger.info(f"🎯 第三层处理：{len(tier3_stocks)} 只中等不足股票，预算 ${remaining_funds:,.2f}")
-        
-        for _, stock in tier3_stocks.sort_values('deviation').iterrows():
-            if remaining_funds < stock['price'] * 10:  # 至少要能买10股
-                break
-            
-            target_improvement = tier_config.get('tier3_target_improvement', 0.3)
-            needed_improvement = (target_value_per_stock - stock['value']) * target_improvement
-            
-            max_investment = min(
-                needed_improvement,
-                remaining_funds * 0.5  # 第三层单股最多50%剩余资金
-            )
-            
-            if max_investment > stock['price']:
-                shares = int(max_investment / stock['price'])
-                cost = shares * stock['price']
-                
-                trades.append({
-                    'symbol': stock['symbol'],
-                    'action': 'BUY',
-                    'shares': shares,
-                    'price': stock['price'],
-                    'amount': cost,
-                    'current_value': stock['value'],
-                    'target_value': target_value_per_stock,
-                    'difference': target_value_per_stock - stock['value'],
-                    'current_weight': stock['value'] / total_portfolio_value,
-                    'target_weight': target_value_per_stock / total_portfolio_value,
-                    'priority': 'TIER3_MODERATE',
-                    'reason': f'中等不足{stock["deviation"]:.2%}'
-                })
-                
-                remaining_funds -= cost
-                logger.info(f"  📈 {stock['symbol']}: 买入 {shares} 股 (${cost:,.2f})")
-        
-        return remaining_funds
-    
-    def _comprehensive_rebalancing(self, underweight_stocks, available_funds, target_value_per_stock, 
-                                  total_portfolio_value, config, trades):
-        """
-        全面改善权重平衡
-        """
-        logger.info(f"✅ 全面改善：{len(underweight_stocks)} 只不足权重股票")
-        
-        remaining_funds = available_funds
-        
-        for _, stock in underweight_stocks.sort_values('deviation').iterrows():
-            if remaining_funds < stock['price']:
-                break
-            
-            # 尽可能接近目标权重
-            needed_investment = target_value_per_stock - stock['value']
-            max_investment = min(
-                needed_investment,
-                remaining_funds * 0.8 / len(underweight_stocks),  # 平均分配
-                remaining_funds * 0.1  # 单股最多10%
-            )
-            
-            if max_investment > stock['price']:
-                shares = int(max_investment / stock['price'])
-                cost = shares * stock['price']
-                
-                trades.append({
-                    'symbol': stock['symbol'],
-                    'action': 'BUY',
-                    'shares': shares,
-                    'price': stock['price'],
-                    'amount': cost,
-                    'current_value': stock['value'],
-                    'target_value': target_value_per_stock,
-                    'difference': target_value_per_stock - stock['value'],
-                    'current_weight': stock['value'] / total_portfolio_value,
-                    'target_weight': target_value_per_stock / total_portfolio_value,
-                    'priority': 'COMPREHENSIVE',
-                    'reason': f'全面改善{stock["deviation"]:.2%}'
-                })
-                
-                remaining_funds -= cost
-                logger.info(f"  📈 {stock['symbol']}: 买入 {shares} 股 (${cost:,.2f})")
-        
-        return remaining_funds
-    
-    def _log_rebalancing_summary(self, trades, total_available_funds, remaining_funds):
-        """
-        记录再平衡摘要
-        """
-        if not trades:
-            return
-        
-        buy_trades = [t for t in trades if t['action'] == 'BUY']
-        sell_trades = [t for t in trades if t['action'] == 'SELL']
-        liquidate_trades = [t for t in trades if t['action'] == 'LIQUIDATE']
-        
-        total_buy_amount = sum(t['amount'] for t in buy_trades)
-        total_sell_amount = sum(t['amount'] for t in sell_trades)
-        total_liquidate_amount = sum(t['amount'] for t in liquidate_trades)
-        
-        logger.info(f"\n💰 === 分层再平衡摘要 ===")
-        logger.info(f"总可用资金: ${total_available_funds:,.2f}")
-        logger.info(f"买入交易: {len(buy_trades)} 笔，总计 ${total_buy_amount:,.2f}")
-        logger.info(f"卖出交易: {len(sell_trades)} 笔，总计 ${total_sell_amount:,.2f}")
-        logger.info(f"清仓交易: {len(liquidate_trades)} 笔，总计 ${total_liquidate_amount:,.2f}")
-        logger.info(f"剩余现金: ${remaining_funds:,.2f}")
-        logger.info(f"资金利用率: {(total_available_funds - remaining_funds) / total_available_funds:.2%}")
-        
-        # 按优先级统计
-        priority_stats = {}
-        for trade in trades:
-            priority = trade.get('priority', 'UNKNOWN')
-            if priority not in priority_stats:
-                priority_stats[priority] = {'count': 0, 'amount': 0}
-            priority_stats[priority]['count'] += 1
-            priority_stats[priority]['amount'] += trade['amount']
-        
-        logger.info(f"\n📊 === 优先级统计 ===")
-        for priority, stats in priority_stats.items():
-            logger.info(f"{priority}: {stats['count']} 笔交易，${stats['amount']:,.2f}")
-    
-    def _create_liquidation_only_df(self, liquidated_stocks):
-        """创建仅包含清仓指令的DataFrame"""
-        liquidation_actions = []
-        for _, stock in liquidated_stocks.iterrows():
-            liquidation_actions.append({
-                'symbol': stock['symbol'],
-                'action': 'LIQUIDATE',
-                'shares': int(stock['shares']),
-                'price': stock['price'],
-                'amount': stock['value'],
-                'current_value': stock['value'],
-                'target_value': 0,
-                'difference': -stock['value'],
-                'current_weight': stock['weight'] if 'weight' in stock else 0,
-                'target_weight': 0,
-                'priority': 'LIQUIDATION',
-                'reason': '清仓'
-            })
-        return pd.DataFrame(liquidation_actions)
-    
+
     def generate_rebalance_report(self, portfolio_df, rebalance_df, save_to_file=True):
         """
         生成再平衡报告
@@ -1318,7 +756,7 @@ class FixedSeekingAlphaScraper:
             self.driver.get(portfolio_url)
             
             # 等待页面初始加载
-            time.sleep(5)
+            time.sleep(3)
             
             # 检查是否需要登录
             if "login" in self.driver.current_url.lower():
@@ -1412,7 +850,7 @@ def main(portfolio_id=None):
             WebDriverWait(scraper.driver, 10).until(
                 EC.presence_of_element_located((By.XPATH, "//table"))
             )
-            scraper.scroll_and_load_all_data()
+            # scraper.scroll_and_load_all_data()
             print("✅ 页面滚动和数据加载完成")
         except Exception as e:
             print(f"⚠️ 页面滚动过程中出现问题: {e}")
@@ -1443,41 +881,16 @@ def main(portfolio_id=None):
             df.to_csv(csv_file, index=False, encoding='utf-8-sig')
             print(f"\n数据已保存到: {csv_file}")
             
-            # 计算等权重再平衡（分层处理策略）
-            print("\n=== 🎯 开始计算等权重再平衡（分层处理策略）===")
+            # 计算简化等权重再平衡策略
+            print("\n=== 🎯 开始计算简化等权重再平衡策略 ===")
             
-            # 创建配置
-            config = {
-                'target_stock_count': 30,
-                'target_cash_amount': 200,
-                'liquidate_symbols': ['OKTA', 'INTA'],
-                'exclude_symbols': ['CASH'],
-                'deviation_thresholds': {
-                    'critical': 0.02,
-                    'severe': 0.015,
-                    'moderate': 0.01,
-                    'minor': 0.005,
-                    'target_range': 0.003
-                },
-                'tier_allocation': {
-                    'tier1_budget_ratio': 0.6,
-                    'tier2_budget_ratio': 0.3,
-                    'tier3_budget_ratio': 0.1,
-                    'max_single_stock_ratio': 0.15,
-                    'tier1_target_improvement': 0.7,
-                    'tier2_target_improvement': 0.5,
-                    'tier3_target_improvement': 0.3
-                }
-            }
+            # 使用简化算法（使用默认配置）
+            rebalance_df = scraper.calculate_equal_weight_rebalance(df)
             
-            rebalance_df = scraper.calculate_equal_weight_rebalance(df, config)
-            
-            print("\n💡 分层处理策略说明:")
-            print("- 第一层(60%资金): 处理偏离>2%的临界不足股票")
-            print("- 第二层(30%资金): 处理偏离1.5%-2%的严重不足股票")
-            print("- 第三层(10%资金): 处理偏离0.5%-1.5%的中等不足股票")
-            print("- 超配股票: 自动卖出偏离>1.5%的股票")
-            print("- 资金智能分配: 根据资金覆盖率选择最优策略")
+            print("\n💡 简化算法说明:")
+            print("- 等权重分配：每只股票获得相等的资金分配")
+            print("- 向上取整：目标股数按向上取整原则计算")
+            print("- 生成交易指令：比较当前持股与目标持股生成买卖操作")
             
             # 生成报告
             print("\n=== 📋 生成再平衡报告 ===")
@@ -1524,17 +937,8 @@ def quick_analyze_portfolio(portfolio_id, target_stock_count=30, target_cash_amo
         df = scraper.scrape_portfolio_by_id(portfolio_id)
         
         if df is not None:
-            # 创建配置
-            config = {
-                'target_stock_count': target_stock_count,
-                'target_cash_amount': target_cash_amount,
-                'target_cash_percentage': target_cash_percentage,
-                'liquidate_symbols': liquidate_symbols or [],
-                'exclude_symbols': exclude_symbols or ['CASH']
-            }
-            
-            # 计算分层再平衡
-            rebalance_df = scraper.calculate_equal_weight_rebalance(df, config)
+            # 计算简化等权重再平衡（使用默认配置）
+            rebalance_df = scraper.calculate_equal_weight_rebalance(df)
             
             # 生成报告
             report = scraper.generate_rebalance_report(df, rebalance_df, save_to_file=True)
