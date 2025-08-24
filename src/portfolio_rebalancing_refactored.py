@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SeekingAlpha投资组合等权重再平衡器 - 重构版
+SeekingAlpha投资组合等权重再平衡器 - 本地文件版
+纯本地MHTML文件解析模式，避免机器人检测
 遵循MECE和KISS原则的简化设计
 """
 
@@ -9,9 +10,14 @@ import pandas as pd
 import numpy as np
 import logging
 import os
+import re
+import quopri
 from datetime import datetime
 from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass
+
+# 本地文件解析导入
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
@@ -364,10 +370,17 @@ class EqualWeightCalculator:
             if trades_df is not None and not trades_df.empty:
                 trades_df.to_excel(writer, sheet_name='交易指令', index=False)
             
+            # 计算投资组合总价值（适配简化数据格式）
+            if 'value' in portfolio_df.columns:
+                total_value = portfolio_df['value'].sum()
+            else:
+                # 简化格式：计算 price * shares
+                total_value = (portfolio_df['price'] * portfolio_df['shares']).sum()
+            
             # 写入摘要信息
             summary_data = {
                 '生成时间': [datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-                '投资组合总价值': [f"${portfolio_df['value'].sum():,.2f}"],
+                '投资组合总价值': [f"${total_value:,.2f}"],
                 '股票数量': [len(portfolio_df)],
                 '交易数量': [len(trades_df) if trades_df is not None else 0],
                 '最小交易金额': [f"${self.config.min_trade_amount:,.2f}"],
@@ -378,6 +391,335 @@ class EqualWeightCalculator:
         
         logger.info(f"📊 再平衡计划已导出到: {filepath}")
         return filepath
+
+
+class PortfolioScraper:
+    """本地MHTML文件投资组合解析器"""
+    
+    def __init__(self):
+        pass
+    
+    
+    def scrape_portfolio(self, file_path: str) -> Optional[pd.DataFrame]:
+        """
+        从本地MHTML/HTML文件解析投资组合数据
+        
+        Args:
+            file_path: 本地MHTML或HTML文件路径
+            
+        Returns:
+            符合重构版算法格式的DataFrame
+        """
+        if not os.path.exists(file_path):
+            logger.error(f"文件不存在: {file_path}")
+            return None
+            
+        logger.info(f"本地文件模式: {file_path}")
+        return self._scrape_from_local_file(file_path)
+    
+    def _scrape_from_local_file(self, file_path: str) -> Optional[pd.DataFrame]:
+        """
+        从本地MHTML/HTML文件解析数据
+        
+        Args:
+            file_path: 本地文件路径
+            
+        Returns:
+            投资组合数据DataFrame
+        """
+        try:
+            logger.info(f"正在读取本地文件: {file_path}")
+            
+            # 读取文件内容
+            html_content = self._read_mhtml_file(file_path)
+            if not html_content:
+                logger.error("无法读取文件内容")
+                return None
+            
+            # 解析HTML内容
+            soup = BeautifulSoup(html_content, 'html.parser')
+            return self._parse_portfolio_data(soup)
+            
+        except Exception as e:
+            logger.error(f"从本地文件解析数据失败: {e}")
+            return None
+    
+    
+    def _parse_portfolio_data(self, soup) -> Optional[pd.DataFrame]:
+        """
+        解析投资组合数据（全局搜索版 - 不依赖表格结构）
+        
+        Args:
+            soup: BeautifulSoup对象
+            
+        Returns:
+            3字段DataFrame: symbol, price, shares
+        """
+        try:
+            # 直接查找所有股票名称元素，不依赖表格结构
+            ticker_elements = soup.find_all(attrs={'data-test-id': 'portfolio-ticker-name'})
+            logger.info(f"找到 {len(ticker_elements)} 个股票名称元素")
+            
+            portfolio_data = []
+            
+            for ticker_elem in ticker_elements:
+                symbol = ticker_elem.get_text(strip=True)
+                
+                # 跳过现金项目
+                if symbol.upper() in ['CASH', 'CURRENCY']:
+                    logger.debug(f"跳过现金项目: {symbol}")
+                    continue
+                
+                # 跳过无效的股票名称（包含空格或非字母字符）
+                if not symbol or len(symbol) < 2 or not symbol.replace(' ', '').isalpha():
+                    logger.debug(f"跳过无效股票名称: '{symbol}'")
+                    continue
+                
+                # 清理股票名称（移除空格）
+                symbol = symbol.replace(' ', '')
+                
+                # 查找对应的价格和股数
+                stock_data = self._extract_stock_data_for_symbol(soup, ticker_elem, symbol)
+                if stock_data:
+                    portfolio_data.append(stock_data)
+                    logger.debug(f"提取: {stock_data['symbol']} - ${stock_data['price']} × {stock_data['shares']}")
+            
+            if not portfolio_data:
+                logger.warning("未能提取到有效的投资组合数据")
+                return None
+            
+            df = pd.DataFrame(portfolio_data)
+            
+            # 移除重复项
+            before_count = len(df)
+            df = df.drop_duplicates(subset=['symbol']).reset_index(drop=True)
+            after_count = len(df)
+            
+            if before_count != after_count:
+                logger.info(f"移除 {before_count - after_count} 条重复记录")
+            
+            logger.info(f"成功提取 {len(df)} 条投资组合记录")
+            return df
+            
+        except Exception as e:
+            logger.error(f"数据解析失败: {e}")
+            return None
+    
+    def _extract_stock_data_for_symbol(self, soup, ticker_elem, symbol) -> Optional[Dict]:
+        """
+        为特定股票符号查找价格和股数数据
+        
+        Args:
+            soup: BeautifulSoup对象
+            ticker_elem: 股票名称元素
+            symbol: 清理后的股票符号
+            
+        Returns:
+            股票数据字典或None
+        """
+        try:
+            stock_data = {'symbol': symbol}
+            
+            # 方法1: 在同一个父级容器中查找
+            parent = ticker_elem
+            for _ in range(10):  # 最多向上找10级
+                parent = parent.parent
+                if not parent:
+                    break
+                
+                # 查找价格
+                if 'price' not in stock_data:
+                    price_elem = parent.find(attrs={'data-test-id': 'portfolio-ticker-price-price'})
+                    if price_elem:
+                        try:
+                            price_text = price_elem.get_text(strip=True)
+                            stock_data['price'] = float(price_text.replace(',', ''))
+                        except:
+                            pass
+                
+                # 查找股数
+                if 'shares' not in stock_data:
+                    shares_elem = parent.find(attrs={'data-test-id': 'share-value'})
+                    if shares_elem:
+                        try:
+                            shares_text = shares_elem.get_text(strip=True)
+                            stock_data['shares'] = float(shares_text.replace(',', ''))
+                        except:
+                            pass
+                
+                # 如果找到了价格和股数，退出搜索
+                if 'price' in stock_data and 'shares' in stock_data:
+                    break
+            
+            # 方法2: 如果在同一父级中没找到，尝试全局搜索相关元素
+            if 'price' not in stock_data or 'shares' not in stock_data:
+                # 这里可以添加更复杂的匹配逻辑
+                pass
+            
+            # 只有同时找到价格和股数才返回数据
+            if 'price' in stock_data and 'shares' in stock_data:
+                return stock_data
+            else:
+                logger.debug(f"股票 {symbol} 缺少数据: price={'price' in stock_data}, shares={'shares' in stock_data}")
+                return None
+                
+        except Exception as e:
+            logger.debug(f"提取股票 {symbol} 数据失败: {e}")
+            return None
+    
+    def _extract_stock_data_simple(self, row) -> Optional[Dict]:
+        """
+        从HTML行中提取股票数据（精确版 - 使用正确的data-test-id选择器）
+        
+        Args:
+            row: BeautifulSoup行元素
+            
+        Returns:
+            股票数据字典 {symbol, price, shares} 或None
+        """
+        try:
+            # 1. 提取股票符号
+            symbol_element = row.find('span', {'data-test-id': 'portfolio-ticker-name'})
+            if not symbol_element:
+                logger.debug("未找到股票符号元素")
+                return None
+            symbol = symbol_element.get_text(strip=True)
+            
+            # 跳过现金项目
+            if symbol.upper() in ['CASH', 'CURRENCY']:
+                logger.debug(f"跳过现金项目: {symbol}")
+                return None
+            
+            # 2. 提取价格（价格元素是div标签，不是span）
+            price_element = row.find(attrs={'data-test-id': 'portfolio-ticker-price-price'})
+            if not price_element:
+                logger.debug(f"未找到价格元素: {symbol}")
+                return None
+            price_text = price_element.get_text(strip=True)
+            price = float(price_text.replace(',', ''))
+            
+            # 3. 提取股数
+            shares_element = row.find('span', {'data-test-id': 'share-value'})
+            if not shares_element:
+                # 对于没有股数的股票（如DB显示"+Add lot"），跳过
+                logger.debug(f"未找到股数元素，跳过: {symbol}")
+                return None
+            shares_text = shares_element.get_text(strip=True)
+            
+            # 处理股数格式（可能包含逗号）
+            if ',' in shares_text:
+                shares = float(shares_text.replace(',', ''))
+            else:
+                shares = float(shares_text)
+            
+            logger.debug(f"精确提取股票: {symbol}, 价格: ${price}, 股数: {shares}")
+            
+            return {
+                'symbol': symbol,
+                'price': price,
+                'shares': shares
+            }
+            
+        except Exception as e:
+            logger.debug(f"提取股票数据失败: {e}")
+            return None
+    
+    def _read_mhtml_file(self, file_path: str) -> Optional[str]:
+        """
+        读取MHTML文件并提取HTML内容
+        
+        Args:
+            file_path: MHTML文件路径
+            
+        Returns:
+            HTML内容字符串或None
+        """
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            
+            # 如果是普通HTML文件，直接返回
+            if file_path.lower().endswith('.html'):
+                return content
+            
+            # 如果是MHTML文件，需要提取HTML部分
+            if file_path.lower().endswith('.mhtml'):
+                return self._extract_html_from_mhtml(content)
+            
+            # 尝试直接解析
+            return content
+            
+        except Exception as e:
+            logger.error(f"读取文件失败: {e}")
+            return None
+    
+    def _extract_html_from_mhtml(self, mhtml_content: str) -> Optional[str]:
+        """
+        从MHTML内容中提取HTML部分
+        
+        Args:
+            mhtml_content: MHTML文件完整内容
+            
+        Returns:
+            HTML内容字符串或None
+        """
+        try:
+            # MHTML文件格式：多个MIME部分，HTML通常在第一个或第二个部分
+            # 寻找包含quoted-printable编码的HTML内容
+            html_section_pattern = r'Content-Type: text/html.*?Content-Transfer-Encoding: quoted-printable.*?\n\n(.*?)(?=\n--.*?|\Z)'
+            match = re.search(html_section_pattern, mhtml_content, re.DOTALL | re.IGNORECASE)
+            
+            if match:
+                encoded_html = match.group(1)
+                # 尝试多种解码方法
+                try:
+                    # 方法1: 使用latin1编码（通常适用于MHTML）
+                    decoded_html = quopri.decodestring(encoded_html.encode()).decode('latin1')
+                    if '<html' in decoded_html.lower():
+                        logger.info("成功从MHTML中提取并解码HTML内容 (latin1)")
+                        return decoded_html
+                except Exception:
+                    pass
+                
+                try:
+                    # 方法2: 使用utf-8编码
+                    decoded_html = quopri.decodestring(encoded_html.encode()).decode('utf-8')
+                    if '<html' in decoded_html.lower():
+                        logger.info("成功从MHTML中提取并解码HTML内容 (utf-8)")
+                        return decoded_html
+                except Exception:
+                    pass
+                
+                try:
+                    # 方法3: 直接使用原始内容
+                    if '<html' in encoded_html.lower():
+                        logger.info("成功从MHTML中提取HTML内容 (原始)")
+                        return encoded_html
+                except Exception:
+                    pass
+            
+            # 备用方案：寻找直接的HTML内容
+            patterns = [
+                r'Content-Type: text/html.*?\n\n(.*?)(?=\n--.*?Content-Type|\nFrom:|\Z)',
+                r'<html.*?</html>',
+                r'<!DOCTYPE html.*?</html>',
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, mhtml_content, re.DOTALL | re.IGNORECASE)
+                if match:
+                    html_content = match.group(1) if len(match.groups()) > 0 else match.group(0)
+                    if '<html' in html_content.lower():
+                        logger.info("成功从MHTML中提取HTML内容")
+                        return html_content
+            
+            logger.warning("无法从MHTML中提取HTML内容")
+            return None
+            
+        except Exception as e:
+            logger.error(f"从MHTML提取HTML失败: {e}")
+            return None
+
 
 
 class FixedSeekingAlphaScraper:
@@ -405,6 +747,100 @@ class FixedSeekingAlphaScraper:
             'min_trade_amount': 100.0,
             'cash_adjustment': 0.0
         }
+
+
+class PortfolioRebalancer:
+    """完整的投资组合再平衡器 - 爬虫 + 算法集成"""
+    
+    def __init__(self, config: RebalanceConfig = None):
+        self.config = config or RebalanceConfig()
+        self.calculator = EqualWeightCalculator(self.config)
+    
+    def scrape_and_rebalance(self, file_path: str) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+        """
+        一站式服务：本地文件解析 → 算法 → Excel导出
+        
+        Args:
+            file_path: 本地MHTML/HTML文件路径
+            
+        Returns:
+            (交易指令DataFrame, Excel文件路径) 或 (None, None)
+        """
+        if not os.path.exists(file_path):
+            logger.error(f"文件不存在: {file_path}")
+            return None, None
+        
+        try:
+            logger.info(f"开始完整的再平衡流程 - 本地文件模式: {file_path}")
+            
+            # 1. 解析本地文件数据
+            scraper = PortfolioScraper()
+            logger.info("正在解析本地文件数据...")
+            portfolio_df = scraper.scrape_portfolio(file_path)
+            
+            if portfolio_df is None or portfolio_df.empty:
+                logger.error("❌ 无法获取投资组合数据")
+                return None, None
+            
+            # 显示爬取结果
+            logger.info(f"✅ 成功爬取 {len(portfolio_df)} 只股票")
+            logger.info("📊 投资组合预览:")
+            for _, stock in portfolio_df.head().iterrows():
+                logger.info(f"  {stock['symbol']}: ${stock['price']:.2f} × {stock['shares']:.0f}")
+            
+            # 2. 计算再平衡
+            logger.info("⚖️ 正在计算等权重再平衡策略...")
+            trades_df = self.calculator.calculate(portfolio_df)
+            
+            if trades_df is None:
+                logger.info("投资组合已接近等权重，无需再平衡")
+                # 仍然导出当前状态
+                file_basename = os.path.splitext(os.path.basename(file_path))[0]
+                output_name = f"rebalance_{file_basename}"
+                excel_path = self.calculator.export_to_excel(None, portfolio_df, output_name)
+                return None, excel_path
+            
+            # 3. 导出Excel报告
+            logger.info("正在生成Excel报告...")
+            # 生成输出文件名
+            file_basename = os.path.splitext(os.path.basename(file_path))[0]
+            output_name = f"rebalance_{file_basename}"
+            
+            excel_path = self.calculator.export_to_excel(trades_df, portfolio_df, output_name)
+            
+            logger.info(f"再平衡流程完成! Excel报告: {excel_path}")
+            return trades_df, excel_path
+            
+        except Exception as e:
+            logger.error(f"❌ 再平衡流程失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None
+    
+    def analyze_portfolio_from_data(self, portfolio_df: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+        """
+        从现有数据分析投资组合（不使用爬虫）
+        
+        Args:
+            portfolio_df: 投资组合数据
+            
+        Returns:
+            (交易指令DataFrame, Excel文件路径) 或 (None, None)
+        """
+        try:
+            logger.info("⚖️ 正在分析投资组合数据...")
+            
+            # 计算再平衡
+            trades_df = self.calculator.calculate(portfolio_df)
+            
+            # 导出Excel报告
+            excel_path = self.calculator.export_to_excel(trades_df, portfolio_df)
+            
+            return trades_df, excel_path
+            
+        except Exception as e:
+            logger.error(f"❌ 投资组合分析失败: {e}")
+            return None, None
 
 
 def test_calculator():
@@ -453,6 +889,84 @@ def test_calculator():
         print(f"\n[Excel] 投资组合状态已导出到: {excel_path}")
 
 
+def main():
+    """主函数 - 纯本地MHTML文件模式"""
+    import sys
+    
+    # 配置日志
+    logging.basicConfig(
+        level=logging.INFO, 
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('portfolio_rebalancing.log', encoding='utf-8')
+        ]
+    )
+    
+    # 检查命令行参数
+    if len(sys.argv) > 1:
+        file_path = sys.argv[1]
+        
+        if not os.path.exists(file_path):
+            print(f"错误: 文件不存在 - {file_path}")
+            print("请确保提供有效的MHTML或HTML文件路径")
+            return
+            
+        print(f"\n本地文件模式 - 文件: {file_path}")
+        print("=" * 50)
+        
+        # 创建配置（支持清仓功能演示）
+        config = RebalanceConfig(
+            min_trade_amount=100.0,
+            cash_adjustment=0.0,
+            liquidation_stocks=[]  # 可以在这里添加要清仓的股票
+        )
+        
+        # 执行数据处理+再平衡
+        rebalancer = PortfolioRebalancer(config)
+        trades_df, excel_path = rebalancer.scrape_and_rebalance(file_path)
+        
+        if trades_df is not None and not trades_df.empty:
+            print("\n交易指令预览:")
+            print(trades_df.to_string(index=False))
+            print(f"\nExcel报告已保存: {excel_path}")
+        else:
+            print("\n无需再平衡或数据处理失败")
+            
+    else:
+        # 本地测试模式：使用测试数据
+        print("\n本地测试模式")
+        print("=" * 50)
+        print("使用示例数据演示功能...")
+        test_calculator()
+        
+        print("\n使用说明:")
+        print("- 本地测试: python portfolio_rebalancing_refactored.py")
+        print("- 本地文件: python portfolio_rebalancing_refactored.py <MHTML文件路径>")
+        print("- 清仓功能: 修改代码中的 liquidation_stocks 参数")
+        print("- 支持格式: .mhtml, .html 文件")
+
+
+def quick_scrape_and_rebalance(file_path: str, liquidation_stocks: List[str] = None) -> None:
+    """
+    快速本地文件解析和再平衡的便捷函数
+    
+    Args:
+        file_path: 本地MHTML/HTML文件路径
+        liquidation_stocks: 要清仓的股票代码列表
+    """
+    config = RebalanceConfig(
+        min_trade_amount=100.0,
+        cash_adjustment=0.0,
+        liquidation_stocks=liquidation_stocks or []
+    )
+    
+    rebalancer = PortfolioRebalancer(config)
+    trades_df, excel_path = rebalancer.scrape_and_rebalance(file_path)
+    
+    print(f"\n完成! Excel报告: {excel_path}")
+    return trades_df, excel_path
+
+
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    test_calculator()
+    main()
