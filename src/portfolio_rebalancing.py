@@ -1,969 +1,637 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SeekingAlpha投资组合在线爬虫
-仅支持在线获取最新数据，删除本地HTML文件读取功能
+SeekingAlpha投资组合等权重再平衡器
+
+专注于再平衡算法和交易指令生成，使用统一的portfolio_data模块进行数据解析。
+遵循MECE和KISS原则的简化设计。
+
+主要功能：
+1. 等权重再平衡计算
+2. 交易指令生成
+3. 清仓功能支持
+4. Excel报告导出
 """
 
 import pandas as pd
 import numpy as np
-import re
-import time
-import json
-import os
-from typing import Dict
-from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
 import logging
+import os
+from datetime import datetime
+from typing import Dict, Optional, Tuple, List
+from dataclasses import dataclass
+
+# 使用统一的数据解析模块
+from portfolio_data import parse_portfolio_basic
 
 logger = logging.getLogger(__name__)
 
 
-class FixedSeekingAlphaScraper:
-    """修复后的SeekingAlpha投资组合爬虫"""
+@dataclass
+class RebalanceConfig:
+    """等权重再平衡配置"""
+    min_trade_amount: float = 100.0        # 最小交易金额
+    cash_adjustment: float = 0.0           # 现金调整: >0追加投入, <0保留现金, =0不调整
+    liquidation_stocks: List[str] = None   # 需要清仓的股票代码列表
+    
+    def __post_init__(self):
+        if self.liquidation_stocks is None:
+            self.liquidation_stocks = []
 
-    def __init__(self, use_existing_browser=True, debug_mode=True):
-        self.use_existing_browser = use_existing_browser
-        self.debug_mode = debug_mode
-        self.driver = None
 
-    def setup_driver(self):
-        """设置浏览器驱动"""
-        chrome_options = Options()
+@dataclass
+class PortfolioSummary:
+    """投资组合摘要"""
+    total_value: float
+    cash_value: float
+    stock_value: float
+    stock_count: int
+    investment_amount: float
+    liquidation_value: float = 0.0    # 清仓股票总价值
+    liquidation_count: int = 0        # 清仓股票数量
+    equal_weight_count: int = 0       # 等权重股票数量
 
-        if self.use_existing_browser:
-            # 连接到现有浏览器实例
-            chrome_options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
-        else:
-            chrome_options.add_argument("--no-sandbox")
-            chrome_options.add_argument("--disable-dev-shm-usage")
 
-        try:
-            self.driver = webdriver.Chrome(options=chrome_options)
-            logger.info("✓ 浏览器驱动设置成功")
-            return True
-        except Exception as e:
-            logger.error(f"浏览器驱动设置失败: {e}")
+@dataclass
+class TradeInstruction:
+    """交易指令"""
+    symbol: str
+    action: str  # 'BUY' or 'SELL'
+    shares: int
+    price: float
+    amount: float
+    current_shares: int
+    target_shares: int
+    current_value: float
+    target_value: float
+    reason: str
+
+
+class EqualWeightCalculator:
+    """等权重再平衡计算器"""
+    
+    def __init__(self, config: RebalanceConfig = None):
+        self.config = config or RebalanceConfig()
+    
+    def calculate(self, portfolio_df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """
+        计算等权重再平衡指令
+        
+        Args:
+            portfolio_df: 投资组合数据
+            
+        Returns:
+            交易指令DataFrame
+        """
+        # 1. 数据验证
+        if not self._validate_data(portfolio_df):
+            return None
+        
+        # 2. 分析投资组合
+        summary = self._analyze_portfolio(portfolio_df)
+        self._log_portfolio_summary(summary)
+        
+        # 3. 计算目标配置
+        target_amount_per_stock = self._calculate_target_amount(summary)
+        
+        # 4. 生成交易指令
+        trades = self._generate_trades(portfolio_df, target_amount_per_stock)
+        
+        if not trades:
+            logger.info("✅ 投资组合已接近等权重，无需再平衡")
+            return None
+            
+        # 5. 输出摘要
+        self._log_trade_summary(trades)
+        
+        return self._trades_to_dataframe(trades)
+    
+    def _validate_data(self, portfolio_df: pd.DataFrame) -> bool:
+        """验证输入数据"""
+        if portfolio_df is None or portfolio_df.empty:
+            logger.error("投资组合数据为空")
             return False
-
-    def clean_symbol_from_element(self, element) -> str:
-        """
-        从HTML元素中提取并清理股票代码
-
-        Args:
-            element: BeautifulSoup元素
-
-        Returns:
-            清理后的股票代码
-        """
-        # 尝试多种方式提取股票代码
-        symbol = None
-
-        # 方法1: 从文本内容提取
-        text = element.get_text(strip=True)
-        if text:
-            # 移除SOURCE部分
-            if '#SOURCE=' in text:
-                symbol = text.split('#SOURCE=')[0]
-            else:
-                symbol = text
-
-        # 方法2: 从href属性提取
-        if not symbol:
-            links = element.find_all('a')
-            for link in links:
-                href = link.get('href', '')
-                if '/symbol/' in href:
-                    # 从URL中提取股票代码
-                    match = re.search(r'/symbol/([A-Z]+)', href)
-                    if match:
-                        symbol = match.group(1)
-                        break
-
-        # 方法3: 从data属性提取
-        if not symbol:
-            for attr in ['data-symbol', 'data-ticker', 'symbol']:
-                attr_value = element.get(attr)
-                if attr_value:
-                    symbol = attr_value
-                    break
-
-        # 清理股票代码
-        if symbol:
-            # 移除特殊字符和URL编码
-            symbol = re.sub(r'[^A-Za-z0-9.-]', '', symbol.strip().upper())
-            # 移除数字后缀（如果存在）
-            symbol = re.sub(r'\d+$', '', symbol)
-
-            # 验证股票代码格式
-            if len(symbol) >= 1 and len(symbol) <= 5 and symbol.isalpha():
-                return symbol
-
-        return None
-
-    def extract_numeric_value(self, element, field_type="price") -> float:
-        """
-        从HTML元素中提取数值
-
-        Args:
-            element: BeautifulSoup元素
-            field_type: 字段类型 (price, shares, weight, value)
-
-        Returns:
-            提取的数值或None
-        """
-        if not element:
-            return None
-
-        text = element.get_text(strip=True)
-
-        if not text or text in ['-', '--', 'N/A', '']:
-            return None
-
-        try:
-            # 移除货币符号、逗号、百分号等
-            clean_text = re.sub(r'[$,%\s]', '', text)
-
-            # 处理百分比
-            if field_type == "weight" and '%' in text:
-                clean_text = re.sub(r'%', '', clean_text)
-                value = float(clean_text) / 100  # 转换为小数
-            else:
-                # 处理负号
-                if text.startswith('-') or text.startswith('('):
-                    clean_text = '-' + re.sub(r'[^\d.]', '', clean_text)
-
-                value = float(clean_text)
-
-            # 合理性检查
-            if field_type == "price" and (value < 0 or value > 10000):
-                return None
-            elif field_type == "shares" and (value < 0 or value > 1000000):
-                return None
-            elif field_type == "weight" and (value < 0 or value > 1):
-                return None
-            elif field_type == "value" and value < 0:
-                return None
-
-            return value
-
-        except (ValueError, AttributeError):
-            if self.debug_mode:
-                logger.debug(f"无法解析 {field_type} 值: '{text}'")
-            return None
-
-    def analyze_table_structure(self, table) -> Dict:
-        """
-        分析表格结构，自动识别列位置
-
-        Args:
-            table: BeautifulSoup表格元素
-
-        Returns:
-            列位置映射字典
-        """
-        logger.info("正在分析表格结构...")
-
-        # 查找表头
-        headers = []
-        header_row = table.find('tr')
-        if header_row:
-            header_cells = header_row.find_all(['th', 'td'])
-            headers = [cell.get_text(strip=True).lower() for cell in header_cells]
-
-        logger.info(f"表头: {headers}")
-
-        # 定义列匹配模式
-        column_patterns = {
-            'symbol': ['symbol', 'ticker', 'stock', 'name', 'company'],
-            'price': ['price', 'last', 'current', '$'],
-            'shares': ['shares', 'quantity', 'qty', 'position', 'amount'],
-            'weight': ['weight', '%', 'allocation', 'percent'],
-            'value': ['value', 'market value', 'position value', 'total']
-        }
-
-        column_map = {}
-
-        # 自动匹配列位置
-        for col_type, patterns in column_patterns.items():
-            for i, header in enumerate(headers):
-                if any(pattern in header for pattern in patterns):
-                    column_map[col_type] = i
-                    break
-
-        logger.info(f"列映射: {column_map}")
-
-        # 如果无法识别所有列，尝试基于位置的默认映射
-        if len(column_map) < 4:
-            logger.warning("无法识别所有列，使用默认位置映射")
-            column_map = {
-                'symbol': 0,
-                'price': 1,
-                'shares': 2,
-                'weight': 3,
-                'value': 4
-            }
-
-        return column_map
-
-    def scroll_and_load_all_data(self, max_scrolls=20, scroll_pause_time=1):
-        """
-        向下滚动页面并等待所有数据加载完成（改进版）
-        
-        Args:
-            max_scrolls: 最大滚动次数
-            scroll_pause_time: 每次滚动后的等待时间（秒）
-        """
-        try:
-            logger.info("开始滚动页面加载所有数据...")
             
-            # 获取初始表格行数
-            initial_rows = self.driver.find_elements(By.XPATH, "//tbody[@data-test-id='table-body']//tr")
-            last_row_count = len(initial_rows)
-            logger.info(f"初始表格行数: {last_row_count}")
+        required_columns = ['symbol', 'price', 'shares']
+        missing_columns = [col for col in required_columns if col not in portfolio_df.columns]
+        if missing_columns:
+            logger.error(f"缺少必要列: {missing_columns}")
+            return False
             
-            # 获取初始页面高度
-            last_height = self.driver.execute_script("return document.body.scrollHeight")
-            scroll_count = 0
-            no_change_count = 0
-            
-            while scroll_count < max_scrolls:
-                # 使用多种滚动方式
-                if scroll_count % 3 == 0:
-                    # 滚动到页面底部
-                    self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                elif scroll_count % 3 == 1:
-                    # 向下滚动一个屏幕高度
-                    self.driver.execute_script("window.scrollBy(0, window.innerHeight);")
-                else:
-                    # 平滑滚动到底部
-                    self.driver.execute_script("window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'});")
-                
-                # 等待新内容加载
-                time.sleep(scroll_pause_time)
-                
-                # 检查表格行数变化
-                try:
-                    current_rows = self.driver.find_elements(By.XPATH, "//tbody[@data-test-id='table-body']//tr")
-                    current_row_count = len(current_rows)
-                    
-                    if current_row_count > last_row_count:
-                        logger.info(f"第 {scroll_count + 1} 次滚动：表格行数从 {last_row_count} 增加到 {current_row_count}")
-                        last_row_count = current_row_count
-                        no_change_count = 0
-                    else:
-                        no_change_count += 1
-                        logger.info(f"第 {scroll_count + 1} 次滚动：表格行数无变化 ({no_change_count}/5) - 当前 {current_row_count} 行")
-                        
-                        # 如果连续5次滚动都没有新行，则停止
-                        if no_change_count >= 5:
-                            logger.info("表格内容已完全加载")
-                            break
-                except Exception as e:
-                    logger.warning(f"无法检查表格行数: {e}")
-                    # 回退到页面高度检查
-                    new_height = self.driver.execute_script("return document.body.scrollHeight")
-                    if new_height == last_height:
-                        no_change_count += 1
-                        logger.info(f"第 {scroll_count + 1} 次滚动：页面高度无变化 ({no_change_count}/5)")
-                        if no_change_count >= 5:
-                            logger.info("页面内容已完全加载")
-                            break
-                    else:
-                        logger.info(f"第 {scroll_count + 1} 次滚动：页面高度从 {last_height} 增加到 {new_height}")
-                        last_height = new_height
-                        no_change_count = 0
-                
-                scroll_count += 1
-            
-            # 最后滚动到顶部
-            self.driver.execute_script("window.scrollTo(0, 0);")
-            time.sleep(1)
-            
-            # 最终统计
-            try:
-                final_rows = self.driver.find_elements(By.XPATH, "//tbody[@data-test-id='table-body']//tr")
-                logger.info(f"滚动完成，最终发现 {len(final_rows)} 个表格行")
-            except Exception as e:
-                logger.warning(f"无法统计最终表格行数: {e}")
-            
-            logger.info("页面滚动和数据加载完成")
-            
-        except Exception as e:
-            logger.error(f"页面滚动失败: {e}")
-
-    def scrape_portfolio_data_improved(self) -> pd.DataFrame:
-        """
-        改进的投资组合数据爬取方法（包含页面滚动）- 适配新的HTML结构
-
-        Returns:
-            投资组合数据框
-        """
-        try:
-            logger.info("开始爬取投资组合数据...")
-
-            # 等待页面初始加载
-            WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.XPATH, "//table"))
-            )
-            
-            # 滚动页面加载所有数据
-            self.scroll_and_load_all_data()
-
-            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
-
-            # 查找投资组合表格
-            table_body = soup.find('tbody', {'data-test-id': 'table-body'})
-            if not table_body:
-                logger.error("未找到投资组合表格")
-                return None
-
-            portfolio_data = []
-            
-            # 查找所有股票行
-            stock_rows = table_body.find_all('tr', class_='wyOal')
-            logger.info(f"找到 {len(stock_rows)} 只股票")
-            
-            for row_idx, row in enumerate(stock_rows):
-                try:
-                    stock_data = self._extract_stock_data_from_row_new(row)
-                    if stock_data:
-                        portfolio_data.append(stock_data)
-                        if self.debug_mode:
-                            logger.debug(f"✓ 提取成功: {stock_data['symbol']} - ${stock_data['price']} × {stock_data['shares']} = ${stock_data['value']:.2f}")
-                except Exception as e:
-                    if self.debug_mode:
-                        logger.debug(f"处理第 {row_idx + 1} 行时出错: {e}")
-                    continue
-
-            if not portfolio_data:
-                logger.warning("未能提取到有效的投资组合数据")
-                return None
-
-            df = pd.DataFrame(portfolio_data)
-
-            # 数据验证和清理
-            logger.info(f"成功提取 {len(df)} 条投资组合记录")
-
-            # 移除重复项
-            before_dedup = len(df)
-            df = df.drop_duplicates(subset=['symbol']).reset_index(drop=True)
-            after_dedup = len(df)
-
-            if before_dedup != after_dedup:
-                logger.info(f"移除 {before_dedup - after_dedup} 条重复记录")
-
-            # 计算总市值
-            total_value = df['value'].sum()
-            logger.info(f"投资组合总价值: ${total_value:,.2f}")
-
-            # 重新计算权重（确保一致性）
-            df['calculated_weight'] = df['value'] / total_value
-
-            return df
-
-        except Exception as e:
-            logger.error(f"数据爬取失败: {e}")
-            return None
+        return True
     
-    def _extract_stock_data_from_row_new(self, row):
-        """
-        从HTML行中提取股票数据（新版本适配data-test-id结构）
+    def _analyze_portfolio(self, portfolio_df: pd.DataFrame) -> PortfolioSummary:
+        """分析投资组合"""
+        # 计算value列：price * shares
+        portfolio_df = portfolio_df.copy()
+        portfolio_df['value'] = portfolio_df['price'] * portfolio_df['shares']
         
-        Args:
-            row: BeautifulSoup行元素
-            
-        Returns:
-            股票数据字典或None
-        """
-        try:
-            # 提取股票代码
-            symbol_element = row.find('span', {'data-test-id': 'portfolio-ticker-name'})
-            if not symbol_element:
-                return None
-            symbol = symbol_element.get_text(strip=True)
-            
-            # 检查是否是现金项目
-            if symbol.upper() in ['CASH', 'CURRENCY']:
-                # 对于现金项目，处理方式不同
-                weight_element = row.find('div', {'data-test-id': 'portfolio-ticker-price-weight'})
-                weight = None
-                if weight_element:
-                    weight_text = weight_element.find('span').get_text(strip=True)
-                    if weight_text.endswith('%'):
-                        weight = float(weight_text.replace('%', '')) / 100
-                
-                # 提取现金价值
-                value_element = row.find('div', {'data-test-id': 'portfolio-ticker-price-value'})
-                if not value_element:
-                    return None
-                value_text = value_element.find('span').get_text(strip=True)
-                value = float(value_text.replace(',', ''))
-                
-                return {
-                    'symbol': 'CASH',
-                    'price': 1.0,  # 现金价格固定为1
-                    'shares': value,  # 现金数量等于价值
-                    'weight': weight,
-                    'value': value,
-                    'calculated_value': value
-                }
-            
-            # 提取价格
-            price_element = row.find('div', {'data-test-id': 'portfolio-ticker-price-price'})
-            if not price_element:
-                return None
-            price_text = price_element.find('span').get_text(strip=True)
-            price = float(price_text.replace(',', ''))
-            
-            # 提取股数
-            shares_element = row.find('span', {'data-test-id': 'share-value'})
-            if not shares_element:
-                return None
-            shares_text = shares_element.get_text(strip=True)
-            shares = float(shares_text.replace(',', ''))
-            
-            # 提取权重
-            weight_element = row.find('div', {'data-test-id': 'portfolio-ticker-price-weight'})
-            weight = None
-            if weight_element:
-                weight_text = weight_element.find('span').get_text(strip=True)
-                if weight_text.endswith('%'):
-                    weight = float(weight_text.replace('%', '')) / 100
-            
-            # 提取价值
-            value_element = row.find('div', {'data-test-id': 'portfolio-ticker-price-value'})
-            if not value_element:
-                return None
-            value_text = value_element.find('span').get_text(strip=True)
-            value = float(value_text.replace(',', ''))
-            
-            # 验证数据一致性
-            calculated_value = price * shares
-            if abs(calculated_value - value) > 0.1:  # 允许小幅误差
-                logger.warning(f"{symbol}: 计算价值 {calculated_value:.2f} 与显示价值 {value:.2f} 不一致")
-            
-            return {
-                'symbol': symbol,
-                'price': price,
-                'shares': shares,
-                'weight': weight,
-                'value': value,
-                'calculated_value': calculated_value
-            }
-            
-        except Exception as e:
-            if self.debug_mode:
-                logger.debug(f"提取股票数据失败: {e}")
-            return None
-
-    def save_debug_info(self, filename="debug_portfolio_page.html"):
-        """保存调试信息"""
-        if not self.driver:
-            return
-
-        try:
-            # 保存页面源码
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write(self.driver.page_source)
-
-            # 保存页面截图
-            screenshot_file = filename.replace('.html', '_screenshot.png')
-            self.driver.save_screenshot(screenshot_file)
-
-            logger.info(f"调试信息已保存: {filename}, {screenshot_file}")
-
-        except Exception as e:
-            logger.error(f"保存调试信息失败: {e}")
-
+        # 识别清仓股票（只处理投资组合中实际存在的）
+        actual_liquidation_stocks = [s for s in self.config.liquidation_stocks 
+                                   if s in portfolio_df['symbol'].values]
+        
+        # 分离清仓股票和等权重股票
+        liquidation_df = portfolio_df[portfolio_df['symbol'].isin(actual_liquidation_stocks)]
+        equal_weight_df = portfolio_df[~portfolio_df['symbol'].isin(actual_liquidation_stocks)]
+        
+        total_value = portfolio_df['value'].sum()
+        cash_value = 0  # 不再有现金行
+        stock_value = total_value
+        stock_count = len(portfolio_df)
+        
+        # 清仓相关统计
+        liquidation_value = liquidation_df['value'].sum()
+        liquidation_count = len(liquidation_df)
+        equal_weight_count = len(equal_weight_df)
+        
+        # 重新设计现金调整逻辑：清仓资金将加入等权重分配池
+        if self.config.cash_adjustment > 0:
+            # 追加投入：投资金额 = 当前总价值 + 追加金额
+            investment_amount = total_value + self.config.cash_adjustment
+        elif self.config.cash_adjustment < 0:
+            # 保留现金：投资金额 = 当前总价值 - 保留金额(绝对值)
+            investment_amount = total_value - abs(self.config.cash_adjustment)
+        else:
+            # 不调整：投资金额 = 当前总价值
+            investment_amount = total_value
+        
+        return PortfolioSummary(
+            total_value=total_value,
+            cash_value=cash_value,
+            stock_value=stock_value,
+            stock_count=stock_count,
+            investment_amount=investment_amount,
+            liquidation_value=liquidation_value,
+            liquidation_count=liquidation_count,
+            equal_weight_count=equal_weight_count
+        )
     
-    def calculate_equal_weight_rebalance(self, portfolio_df, min_trade_amount=None, cash_reserve_amount=None):
+    def _calculate_target_amount(self, summary: PortfolioSummary) -> float:
+        """计算等权重股票的目标金额（清仓股票不参与等权重分配）"""
+        if summary.equal_weight_count == 0:
+            logger.warning("没有等权重股票数据")
+            return 0.0
+            
+        # 等权重资金 = 总投资金额（包括清仓释放的资金）
+        target_amount = summary.investment_amount / summary.equal_weight_count
+        logger.info(f"💰 等权重股票目标金额: ${target_amount:,.2f} (共{summary.equal_weight_count}只股票)")
+        
+        if summary.liquidation_count > 0:
+            logger.info(f"🗑️ 清仓股票: {summary.liquidation_count}只，价值${summary.liquidation_value:,.2f}")
+            
+        return target_amount
+    
+    def _generate_trades(self, portfolio_df: pd.DataFrame, target_amount_per_stock: float) -> List[TradeInstruction]:
+        """生成交易指令：先处理清仓，再处理等权重"""
+        trades = []
+        # 计算value列：price * shares
+        stocks_df = portfolio_df.copy()
+        stocks_df['value'] = stocks_df['price'] * stocks_df['shares']
+        
+        # 识别清仓股票（只处理投资组合中实际存在的）
+        actual_liquidation_stocks = [s for s in self.config.liquidation_stocks 
+                                   if s in stocks_df['symbol'].values]
+        
+        # 1. 先处理清仓股票（全部卖出）
+        for _, stock in stocks_df.iterrows():
+            if stock['symbol'] in actual_liquidation_stocks:
+                trade = self._calculate_liquidation_trade(stock)
+                if trade:
+                    trades.append(trade)
+        
+        # 2. 再处理等权重股票
+        for _, stock in stocks_df.iterrows():
+            if stock['symbol'] not in actual_liquidation_stocks:
+                trade = self._calculate_single_trade(stock, target_amount_per_stock)
+                if trade:
+                    trades.append(trade)
+                
+        return trades
+    
+    def _calculate_liquidation_trade(self, stock: pd.Series) -> Optional[TradeInstruction]:
+        """计算清仓交易指令"""
+        current_shares = int(stock['shares'])
+        
+        # 如果已经没有持股，跳过
+        if current_shares <= 0:
+            logger.debug(f"{stock['symbol']}: 已无持股，跳过清仓")
+            return None
+            
+        # 全部卖出
+        trade_amount = current_shares * stock['price']
+        
+        # 过滤小额交易
+        if trade_amount < self.config.min_trade_amount:
+            logger.debug(f"{stock['symbol']}: 清仓金额${trade_amount:.2f}小于最小阈值${self.config.min_trade_amount}，跳过")
+            return None
+            
+        return TradeInstruction(
+            symbol=stock['symbol'],
+            action='SELL',
+            shares=current_shares,
+            price=stock['price'],
+            amount=trade_amount,
+            current_shares=current_shares,
+            target_shares=0,
+            current_value=stock['value'],
+            target_value=0.0,
+            reason='清仓卖出'
+        )
+    
+    def _calculate_single_trade(self, stock: pd.Series, target_amount: float) -> Optional[TradeInstruction]:
+        """计算单只股票的交易指令"""
+        # 计算目标持股数（四舍五入）
+        target_shares = int(np.round(target_amount / stock['price']))
+        current_shares = int(stock['shares'])
+        share_diff = target_shares - current_shares
+        trade_amount = abs(share_diff) * stock['price']
+        target_value = target_shares * stock['price']
+        
+        # 调试信息
+        logger.debug(f"{stock['symbol']}: target=${target_amount:.2f}, target_shares={target_shares}, current_shares={current_shares}, diff={share_diff}, trade_amount=${trade_amount:.2f}, actual_target=${target_value:.2f}")
+        
+        # 过滤小额交易和零交易
+        if share_diff == 0:
+            logger.debug(f"{stock['symbol']}: 已达到目标持股数，无需调整")
+            return None
+            
+        if trade_amount < self.config.min_trade_amount:
+            logger.debug(f"{stock['symbol']}: 交易金额${trade_amount:.2f}小于最小阈值${self.config.min_trade_amount}，跳过")
+            return None
+            
+        action = 'BUY' if share_diff > 0 else 'SELL'
+        
+        return TradeInstruction(
+            symbol=stock['symbol'],
+            action=action,
+            shares=abs(share_diff),
+            price=stock['price'],
+            amount=trade_amount,
+            current_shares=current_shares,
+            target_shares=target_shares,
+            current_value=stock['value'],
+            target_value=target_value,
+            reason=f'等权重调整 (${stock["value"]:.0f} → ${target_value:.0f})'
+        )
+    
+    def _log_portfolio_summary(self, summary: PortfolioSummary):
+        """记录投资组合摘要"""
+        logger.info("开始计算简化等权重再平衡策略")
+        
+        # 根据现金调整类型显示不同信息
+        if self.config.cash_adjustment > 0:
+            adjustment_desc = f"追加投入${self.config.cash_adjustment:,.2f}"
+        elif self.config.cash_adjustment < 0:
+            adjustment_desc = f"保留现金${abs(self.config.cash_adjustment):,.2f}"
+        else:
+            adjustment_desc = "不调整现金"
+        
+        # 显示清仓股票配置
+        liquidation_desc = f"清仓股票: {self.config.liquidation_stocks}" if self.config.liquidation_stocks else "无清仓股票"
+            
+        logger.info(f"配置参数: 最小交易金额=${self.config.min_trade_amount}, 现金调整({adjustment_desc}), {liquidation_desc}")
+        logger.info(f"📊 投资组合总价值: ${summary.total_value:,.2f}")
+        logger.info(f"💰 当前现金: ${summary.cash_value:,.2f}")
+        logger.info(f"📈 当前股票价值: ${summary.stock_value:,.2f}")
+        logger.info(f"🎯 总投资金额: ${summary.investment_amount:,.2f}")
+        logger.info(f"📊 股票总数: {summary.stock_count} (等权重: {summary.equal_weight_count}, 清仓: {summary.liquidation_count})")
+        
+        if summary.liquidation_count > 0:
+            logger.info(f"🗑️ 清仓股票价值: ${summary.liquidation_value:,.2f}")
+    
+    def _log_trade_summary(self, trades: List[TradeInstruction]):
+        """记录交易摘要"""
+        buy_trades = [t for t in trades if t.action == 'BUY']
+        sell_trades = [t for t in trades if t.action == 'SELL']
+        liquidation_trades = [t for t in sell_trades if t.reason == '清仓卖出']
+        equal_weight_trades = [t for t in trades if t.reason != '清仓卖出']
+        
+        total_buy_amount = sum(t.amount for t in buy_trades)
+        total_sell_amount = sum(t.amount for t in sell_trades)
+        liquidation_amount = sum(t.amount for t in liquidation_trades)
+        
+        logger.info(f"\n💰 === 简化等权重再平衡摘要 ===")
+        logger.info(f"买入交易: {len(buy_trades)} 笔，总计 ${total_buy_amount:,.2f}")
+        logger.info(f"卖出交易: {len(sell_trades)} 笔，总计 ${total_sell_amount:,.2f}")
+        
+        if liquidation_trades:
+            logger.info(f"  其中清仓: {len(liquidation_trades)} 笔，${liquidation_amount:,.2f}")
+            
+        logger.info(f"净资金需求: ${total_buy_amount - total_sell_amount:,.2f}")
+        
+        # 分类记录具体交易
+        if liquidation_trades:
+            logger.info("🗑️ 清仓交易:")
+            for trade in liquidation_trades:
+                logger.info(f"  {trade.symbol}: SELL {trade.shares} shares, ${trade.amount:,.2f}")
+                
+        if equal_weight_trades:
+            logger.info("⚖️ 等权重交易:")
+            for trade in equal_weight_trades:
+                logger.info(f"  {trade.symbol}: {trade.action} {trade.shares} shares, ${trade.amount:,.2f}")
+    
+    def _trades_to_dataframe(self, trades: List[TradeInstruction]) -> pd.DataFrame:
+        """将交易指令转换为DataFrame，按操作类型排序：清仓->卖出->买入"""
+        # 将交易指令转换为DataFrame
+        df = pd.DataFrame([{
+            'symbol': t.symbol,
+            'action': t.action,
+            'shares': t.shares,
+            'price': t.price,
+            'amount': t.amount,
+            'current_shares': t.current_shares,
+            'target_shares': t.target_shares,
+            'current_value': t.current_value,
+            'target_value': t.target_value,
+            'reason': t.reason
+        } for t in trades])
+        
+        # 定义排序优先级：清仓操作 > 普通卖出 > 买入
+        def get_sort_priority(row):
+            if row['reason'] == '清仓卖出':
+                return 1  # 清仓操作排在最前
+            elif row['action'] == 'SELL':
+                return 2  # 普通卖出操作
+            else:  # BUY
+                return 3  # 买入操作排在最后
+        
+        df['sort_priority'] = df.apply(get_sort_priority, axis=1)
+        df = df.sort_values(['sort_priority', 'symbol']).drop('sort_priority', axis=1).reset_index(drop=True)
+        
+        return df
+    
+    def export_to_excel(self, trades_df: pd.DataFrame, portfolio_df: pd.DataFrame, 
+                       output_dir: str = "../rebalance") -> str:
         """
-        简化等权重再平衡算法
+        导出再平衡结果到Excel文件
         
         Args:
-            portfolio_df: 投资组合DataFrame
-            min_trade_amount: 最小交易金额
-            cash_reserve_amount: 预留现金金额（绝对值）
-        
-        Returns:
-            再平衡指令DataFrame
-        """
-        try:
-            # 获取默认配置
-            config = self.get_simple_config()
-            if min_trade_amount is None:
-                min_trade_amount = config['min_trade_amount']
-            if cash_reserve_amount is None:
-                cash_reserve_amount = config['cash_reserve_amount']
+            trades_df: 交易指令DataFrame
+            portfolio_df: 原始投资组合DataFrame
+            output_dir: 输出目录
             
-            logger.info("开始计算简化等权重再平衡策略")
-            logger.info(f"配置参数: 最小交易金额=${min_trade_amount}, 预留现金=${cash_reserve_amount}")
+        Returns:
+            生成的文件路径
+        """
+        # 确保输出目录存在
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 生成文件名（包含时间戳）
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"rebalance_plan_{timestamp}.xlsx"
+        filepath = os.path.join(output_dir, filename)
+        
+        # 创建Excel writer
+        with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+            # 写入原始投资组合
+            portfolio_df.to_excel(writer, sheet_name='原始投资组合', index=False)
+            
+            # 写入交易指令
+            if trades_df is not None and not trades_df.empty:
+                trades_df.to_excel(writer, sheet_name='交易指令', index=False)
+            
+            # 计算投资组合总价值（适配简化数据格式）
+            if 'value' in portfolio_df.columns:
+                total_value = portfolio_df['value'].sum()
+            else:
+                # 简化格式：计算 price * shares
+                total_value = (portfolio_df['price'] * portfolio_df['shares']).sum()
+            
+            # 写入摘要信息
+            summary_data = {
+                '生成时间': [datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+                '投资组合总价值': [f"${total_value:,.2f}"],
+                '股票数量': [len(portfolio_df)],
+                '交易数量': [len(trades_df) if trades_df is not None else 0],
+                '最小交易金额': [f"${self.config.min_trade_amount:,.2f}"],
+                '现金调整': [f"${self.config.cash_adjustment:,.2f}"]
+            }
+            summary_df = pd.DataFrame(summary_data)
+            summary_df.to_excel(writer, sheet_name='摘要信息', index=False)
+        
+        logger.info(f"📊 再平衡计划已导出到: {filepath}")
+        return filepath
+
+
+
+
+
+class PortfolioRebalancer:
+    """完整的投资组合再平衡器 - 爬虫 + 算法集成"""
+    
+    def __init__(self, config: RebalanceConfig = None):
+        self.config = config or RebalanceConfig()
+        self.calculator = EqualWeightCalculator(self.config)
+    
+    def scrape_and_rebalance(self, file_path: str) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+        """
+        一站式服务：本地文件解析 → 算法 → Excel导出
+        
+        Args:
+            file_path: 本地MHTML/HTML文件路径
+            
+        Returns:
+            (交易指令DataFrame, Excel文件路径) 或 (None, None)
+        """
+        if not os.path.exists(file_path):
+            logger.error(f"文件不存在: {file_path}")
+            return None, None
+        
+        try:
+            logger.info(f"开始完整的再平衡流程 - 本地文件模式: {file_path}")
+            
+            # 1. 解析本地文件数据
+            logger.info("正在解析本地文件数据...")
+            portfolio_df = parse_portfolio_basic(file_path)
             
             if portfolio_df is None or portfolio_df.empty:
-                logger.error("投资组合数据为空")
-                return None
+                logger.error("❌ 无法获取投资组合数据")
+                return None, None
             
-            # 1. 分离现金和股票数据
-            cash_rows = portfolio_df[portfolio_df['symbol'] == 'CASH']
-            stocks_df = portfolio_df[portfolio_df['symbol'] != 'CASH'].copy()
+            # 显示爬取结果
+            logger.info(f"✅ 成功爬取 {len(portfolio_df)} 只股票")
+            logger.info("📊 投资组合预览:")
+            for _, stock in portfolio_df.head().iterrows():
+                logger.info(f"  {stock['symbol']}: ${stock['price']:.2f} × {stock['shares']:.0f}")
             
-            if stocks_df.empty:
-                logger.warning("没有股票数据")
-                return None
+            # 2. 计算再平衡
+            logger.info("⚖️ 正在计算等权重再平衡策略...")
+            trades_df = self.calculator.calculate(portfolio_df)
             
-            # 2. 计算总投资金额（包含现金管理）
-            total_portfolio_value = portfolio_df['value'].sum()
-            available_cash = cash_rows['value'].sum() if not cash_rows.empty else 0
-            current_stock_value = stocks_df['value'].sum()
+            if trades_df is None:
+                logger.info("投资组合已接近等权重，无需再平衡")
+                # 仍然导出当前状态
+                file_basename = os.path.splitext(os.path.basename(file_path))[0]
+                output_name = f"rebalance_{file_basename}"
+                excel_path = self.calculator.export_to_excel(None, portfolio_df, output_name)
+                return None, excel_path
             
-            # 总投资金额 = 投资组合总价值 - 预留现金
-            total_investment_amount = total_portfolio_value - cash_reserve_amount
+            # 3. 导出Excel报告
+            logger.info("正在生成Excel报告...")
+            # 生成输出文件名
+            file_basename = os.path.splitext(os.path.basename(file_path))[0]
+            output_name = f"rebalance_{file_basename}"
             
-            logger.info(f"📊 投资组合总价值: ${total_portfolio_value:,.2f}")
-            logger.info(f"💰 当前现金: ${available_cash:,.2f}")
-            logger.info(f"📈 当前股票价值: ${current_stock_value:,.2f}")
-            logger.info(f"🏦 预留现金: ${cash_reserve_amount:,.2f}")
-            logger.info(f"🎯 总投资金额: ${total_investment_amount:,.2f}")
-            logger.info(f"📊 股票数量: {len(stocks_df)}")
+            excel_path = self.calculator.export_to_excel(trades_df, portfolio_df, output_name)
             
-            # 3. 等权重计算：每只股票目标金额
-            stock_count = len(stocks_df)
-            target_amount_per_stock = total_investment_amount / stock_count
-            
-            logger.info(f"💰 每股目标金额: ${target_amount_per_stock:,.2f}")
-            
-            # 4. 计算每只股票的目标持股数（向上取整）
-            stocks_df['target_shares'] = np.ceil(target_amount_per_stock / stocks_df['price'])
-            stocks_df['target_value'] = stocks_df['target_shares'] * stocks_df['price']
-            
-            # 5. 生成买卖指令
-            trades = []
-            total_buy_amount = 0
-            total_sell_amount = 0
-            
-            for _, stock in stocks_df.iterrows():
-                current_shares = int(stock['shares'])
-                target_shares = int(stock['target_shares'])
-                share_diff = target_shares - current_shares
-                trade_amount = abs(share_diff) * stock['price']
-                
-                # 只处理交易金额大于最小交易金额的操作
-                if trade_amount >= min_trade_amount:
-                    action = 'BUY' if share_diff > 0 else 'SELL'
-                    
-                    trades.append({
-                        'symbol': stock['symbol'],
-                        'action': action,
-                        'shares': abs(share_diff),
-                        'price': stock['price'],
-                        'amount': trade_amount,
-                        'current_shares': current_shares,
-                        'target_shares': target_shares,
-                        'current_value': stock['value'],
-                        'target_value': stock['target_value'],
-                        'reason': f'等权重调整 (${stock["value"]:.0f} → ${stock["target_value"]:.0f})'
-                    })
-                    
-                    if action == 'BUY':
-                        total_buy_amount += trade_amount
-                    else:
-                        total_sell_amount += trade_amount
-                    
-                    logger.info(f"  📈 {stock['symbol']}: {action} {abs(share_diff)} 股，${trade_amount:,.2f}")
-            
-            if not trades:
-                logger.info("✅ 投资组合已接近等权重，无需再平衡")
-                return None
-            
-            # 生成摘要
-            logger.info(f"\n💰 === 简化等权重再平衡摘要 ===")
-            logger.info(f"买入交易: {len([t for t in trades if t['action'] == 'BUY'])} 笔，总计 ${total_buy_amount:,.2f}")
-            logger.info(f"卖出交易: {len([t for t in trades if t['action'] == 'SELL'])} 笔，总计 ${total_sell_amount:,.2f}")
-            logger.info(f"净资金需求: ${total_buy_amount - total_sell_amount:,.2f}")
-            
-            return pd.DataFrame(trades)
+            logger.info(f"再平衡流程完成! Excel报告: {excel_path}")
+            return trades_df, excel_path
             
         except Exception as e:
-            logger.error(f"计算简化等权重再平衡失败: {e}")
-            return None
+            logger.error(f"❌ 再平衡流程失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None
     
-    def get_simple_config(self):
+    def analyze_portfolio_from_data(self, portfolio_df: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
         """
-        获取简化配置参数（仅适用于简化等权重算法）
-        
-        Returns:
-            dict: 简化配置字典
-        """
-        return {
-            'min_trade_amount': 100,                   # 最小交易金额
-            'cash_reserve_amount': 0,                  # 预留现金金额（绝对值）
-        }
-    
-
-    def generate_rebalance_report(self, portfolio_df, rebalance_df, save_to_file=True):
-        """
-        生成再平衡报告
+        从现有数据分析投资组合（不使用爬虫）
         
         Args:
-            portfolio_df: 投资组合DataFrame
-            rebalance_df: 再平衡指令DataFrame
-            save_to_file: 是否保存到文件
+            portfolio_df: 投资组合数据
             
         Returns:
-            报告字符串
+            (交易指令DataFrame, Excel文件路径) 或 (None, None)
         """
         try:
-            if portfolio_df is None or portfolio_df.empty:
-                return "无投资组合数据"
-                
-            report_lines = []
-            report_lines.append("=" * 80)
-            report_lines.append("投资组合等权重再平衡报告")
-            report_lines.append(f"生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            report_lines.append("=" * 80)
+            logger.info("⚖️ 正在分析投资组合数据...")
             
-            # 当前投资组合概览
-            total_value = portfolio_df['value'].sum()
-            report_lines.append(f"\n📊 当前投资组合概览:")
-            report_lines.append(f"总价值: ${total_value:,.2f}")
-            report_lines.append(f"股票数量: {len(portfolio_df)}")
-            report_lines.append(f"平均每股价值: ${total_value/len(portfolio_df):,.2f}")
+            # 计算再平衡
+            trades_df = self.calculator.calculate(portfolio_df)
             
-            # 当前持仓详情
-            report_lines.append(f"\n📋 当前持仓详情:")
-            report_lines.append(f"{'股票代码':<8} {'价格':<8} {'股数':<8} {'价值':<12} {'权重':<8}")
-            report_lines.append("-" * 50)
+            # 导出Excel报告
+            excel_path = self.calculator.export_to_excel(trades_df, portfolio_df)
             
-            for _, stock in portfolio_df.iterrows():
-                weight = stock['value'] / total_value
-                report_lines.append(
-                    f"{stock['symbol']:<8} "
-                    f"${stock['price']:<7.2f} "
-                    f"{stock['shares']:<8.0f} "
-                    f"${stock['value']:<11.2f} "
-                    f"{weight:<7.1%}"
-                )
-            
-            # 再平衡指令
-            if rebalance_df is not None and not rebalance_df.empty:
-                report_lines.append(f"\n🔄 再平衡交易指令:")
-                report_lines.append(f"{'股票代码':<8} {'操作':<6} {'股数':<8} {'金额':<12} {'当前权重':<8} {'目标权重':<8}")
-                report_lines.append("-" * 60)
-                
-                for _, action in rebalance_df.iterrows():
-                    report_lines.append(
-                        f"{action['symbol']:<8} "
-                        f"{action['action']:<6} "
-                        f"{action['shares']:<8.0f} "
-                        f"${action['amount']:<11.2f} "
-                        f"{action['current_weight']:<7.1%} "
-                        f"{action['target_weight']:<7.1%}"
-                    )
-                
-                # 策略B详细资金统计
-                buy_amount = rebalance_df[rebalance_df['action'] == 'BUY']['amount'].sum()
-                sell_amount = rebalance_df[rebalance_df['action'] == 'SELL']['amount'].sum()
-                liquidate_amount = rebalance_df[rebalance_df['action'] == 'LIQUIDATE']['amount'].sum()
-                
-                # 计算现金相关数据
-                cash_rows = portfolio_df[portfolio_df['symbol'] == 'CASH']
-                current_cash = cash_rows['value'].sum() if not cash_rows.empty else 0
-                
-                # 预留现金计算（这里使用默认值，实际应该从算法中传递）
-                target_cash_reserve = 2000.0  # 默认值，应该从参数传递
-                
-                # 资金流计算
-                usable_cash = current_cash + liquidate_amount - target_cash_reserve
-                total_funds_available = usable_cash + sell_amount
-                net_cash_needed = buy_amount - sell_amount
-                final_balance = total_funds_available - buy_amount
-                
-                report_lines.append(f"\n💰 策略B资金流详细统计:")
-                report_lines.append(f"📊 资金来源:")
-                report_lines.append(f"  • 当前现金: ${current_cash:,.2f}")
-                report_lines.append(f"  • 清仓获得: ${liquidate_amount:,.2f}")
-                report_lines.append(f"  • 卖出获得: ${sell_amount:,.2f}")
-                report_lines.append(f"  • 总现金来源: ${current_cash + liquidate_amount + sell_amount:,.2f}")
-                
-                report_lines.append(f"\n📊 资金使用:")
-                report_lines.append(f"  • 预留现金: ${target_cash_reserve:,.2f}")
-                report_lines.append(f"  • 买入总额: ${buy_amount:,.2f}")
-                report_lines.append(f"  • 总现金使用: ${target_cash_reserve + buy_amount:,.2f}")
-                
-                report_lines.append(f"\n📊 资金平衡:")
-                report_lines.append(f"  • 可用于投资: ${usable_cash:,.2f}")
-                report_lines.append(f"  • 总可用资金: ${total_funds_available:,.2f}")
-                report_lines.append(f"  • 净现金需求: ${net_cash_needed:,.2f}")
-                report_lines.append(f"  • 最终余额: ${final_balance:,.2f}")
-                
-                # 策略B验证
-                if final_balance >= 0:
-                    report_lines.append(f"\n✅ 策略B成功: 零净投入达成，余额 ${final_balance:,.2f}")
-                    report_lines.append(f"💡 最终现金分布: ${target_cash_reserve:,.2f}(预留) + ${final_balance:,.2f}(余额) = ${target_cash_reserve + final_balance:,.2f}")
-                else:
-                    report_lines.append(f"\n⚠️ 策略B警告: 仍需额外投入 ${abs(final_balance):,.2f}")
-                    
-                # 传统计算对比（显示为什么会出现差异）
-                traditional_shortage = net_cash_needed - (current_cash + liquidate_amount - target_cash_reserve)
-                if traditional_shortage > 0:
-                    report_lines.append(f"\n📝 传统计算显示: 资金不足 ${traditional_shortage:,.2f}")
-                    report_lines.append(f"💡 差异原因: 传统计算未包含卖出获得资金 ${sell_amount:,.2f}")
-            else:
-                report_lines.append(f"\n✅ 投资组合已接近等权重，无需再平衡")
-            
-            report_lines.append("\n" + "=" * 80)
-            
-            report = "\n".join(report_lines)
-            
-            if save_to_file:
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                filename = f"portfolio_rebalance_report_{timestamp}.txt"
-                with open(filename, 'w', encoding='utf-8') as f:
-                    f.write(report)
-                logger.info(f"报告已保存到: {filename}")
-            
-            return report
+            return trades_df, excel_path
             
         except Exception as e:
-            logger.error(f"生成再平衡报告失败: {e}")
-            return f"生成报告失败: {e}"
+            logger.error(f"❌ 投资组合分析失败: {e}")
+            return None, None
+
+
+def test_calculator():
+    """示例用法"""
+    # 示例数据
+    portfolio_data = [
+        {'symbol': 'AAPL', 'price': 150.0, 'shares': 100},
+        {'symbol': 'GOOGL', 'price': 250.0, 'shares': 200},
+        {'symbol': 'MSFT', 'price': 300.0, 'shares': 50},
+        {'symbol': 'NVDA', 'price': 120.0, 'shares': 25},  # 增加持股用于演示清仓
+        {'symbol': 'TSLA', 'price': 180.0, 'shares': 30},  # 新增股票
+    ]
     
-    def scrape_portfolio_by_id(self, portfolio_id, save_html=True):
-        """
-        通过投资组合ID直接获取数据
+    portfolio_df = pd.DataFrame(portfolio_data)
+    # 计算value列用于显示
+    portfolio_df['value'] = portfolio_df['price'] * portfolio_df['shares']
+    
+    print("=== 原始投资组合 ===")
+    print(portfolio_df.to_string(index=False))
+    print(f"\n投资组合总价值: ${portfolio_df['value'].sum():,.2f}")
+    print(f"股票数量: {len(portfolio_df)}")
+
+    # 使用重构后的计算器，演示清仓功能
+    config = RebalanceConfig(
+        min_trade_amount=100.0, 
+        cash_adjustment=0.0,
+        liquidation_stocks=['TSLA']  # 清仓NVDA和TSLA，剩余3只股票等权重
+    )
+    calculator = EqualWeightCalculator(config)
+
+    # 传递原始数据（不包含value列）给计算器
+    input_data = portfolio_df[['symbol', 'price', 'shares']].copy()
+    result = calculator.calculate(input_data)
+    if result is not None:
+        print("\n=== 交易指令 ===")
+        print(result.to_string(index=False))
         
-        Args:
-            portfolio_id: 投资组合ID
-            save_html: 是否保存HTML文件
-            
-        Returns:
-            投资组合数据DataFrame
-        """
-        try:
-            if not self.driver:
-                if not self.setup_driver():
-                    return None
-            
-            # 构建URL
-            portfolio_url = f"https://seekingalpha.com/account/portfolio/total_view?portfolioId={portfolio_id}"
-            
-            logger.info(f"正在访问投资组合: {portfolio_url}")
-            self.driver.get(portfolio_url)
-            
-            # 等待页面初始加载
-            time.sleep(3)
-            
-            # 检查是否需要登录
-            if "login" in self.driver.current_url.lower():
-                logger.warning("需要登录到SeekingAlpha账户")
-                return None
-            
-            # 等待表格出现然后滚动加载所有数据
-            try:
-                WebDriverWait(self.driver, 10).until(
-                    EC.presence_of_element_located((By.XPATH, "//table"))
-                )
-                # 滚动页面加载所有数据
-                self.scroll_and_load_all_data()
-            except Exception as e:
-                logger.warning(f"页面滚动过程中出现问题: {e}")
-            
-            # 保存HTML文件
-            if save_html:
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                backup_html_path = f"portfolio_data_{portfolio_id}_{timestamp}.html"
-                standard_html_path = f"portfolio_data_{portfolio_id}.html"
-                
-                try:
-                    with open(backup_html_path, 'w', encoding='utf-8') as f:
-                        f.write(self.driver.page_source)
-                    with open(standard_html_path, 'w', encoding='utf-8') as f:
-                        f.write(self.driver.page_source)
-                    logger.info(f"页面HTML已保存: {backup_html_path}, {standard_html_path}")
-                except Exception as e:
-                    logger.error(f"保存HTML文件失败: {e}")
-            
-            # 爬取数据
-            return self.scrape_portfolio_data_improved()
-            
-        except Exception as e:
-            logger.error(f"通过ID获取投资组合数据失败: {e}")
-            return None
-
-    def close(self):
-        """关闭浏览器"""
-        if self.driver:
-            self.driver.quit()
+        # 导出到Excel
+        excel_path = calculator.export_to_excel(result, portfolio_df)
+        print(f"\n[Excel] 交易指令已导出到: {excel_path}")
+    else:
+        print("\n=== 无需再平衡 ===")
+        
+        # 即使无需再平衡，也导出当前状态
+        excel_path = calculator.export_to_excel(None, portfolio_df)
+        print(f"\n[Excel] 投资组合状态已导出到: {excel_path}")
 
 
-def main(portfolio_id=None):
-    """主函数 - 仅支持在线爬取"""
+def main():
+    """主函数 - 纯本地MHTML文件模式"""
+    import sys
     
     # 配置日志
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logging.basicConfig(
+        level=logging.INFO, 
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('portfolio_rebalancing.log', encoding='utf-8')
+        ]
+    )
     
-    scraper = FixedSeekingAlphaScraper(use_existing_browser=True, debug_mode=True)
+    # 检查命令行参数，默认使用 src/QuantPortfolios.html
+    if len(sys.argv) > 1:
+        file_path = sys.argv[1]
+    else:
+        file_path = "src/QuantPortfolios.html"
+        print(f"\n使用默认文件: {file_path}")
     
-    # 优先级：命令行参数 > 默认值
-    if portfolio_id is None:
-        portfolio_id = "64139349"  # 默认投资组合ID
-    
-    try:
-        print(f"\n🌐 开始在线爬取投资组合 {portfolio_id}...")
-        
-        # 设置浏览器
-        if not scraper.setup_driver():
-            return
-
-        # 导航到指定的投资组合页面
-        portfolio_url = f"https://seekingalpha.com/account/portfolio/total_view?portfolioId={portfolio_id}"
-        
-        print(f"正在导航到: {portfolio_url}")
-        scraper.driver.get(portfolio_url)
-        
-        # 等待页面加载
-        print("等待页面加载...")
-        time.sleep(2)
-        
-        # 检查是否需要登录
-        if "login" in scraper.driver.current_url.lower():
-            print("⚠️ 需要登录到SeekingAlpha账户")
-            print("请在浏览器中完成登录，然后按Enter继续...")
-            input("按Enter继续爬取数据...")
-            
-            # 重新导航到投资组合页面
-            scraper.driver.get(portfolio_url)
-            time.sleep(5)
-
-        # 滚动页面加载所有数据
-        print("🔄 开始滚动页面加载所有投资组合数据...")
-        try:
-            from selenium.webdriver.support.ui import WebDriverWait
-            from selenium.webdriver.support import expected_conditions as EC
-            from selenium.webdriver.common.by import By
-            
-            WebDriverWait(scraper.driver, 10).until(
-                EC.presence_of_element_located((By.XPATH, "//table"))
-            )
-            # scraper.scroll_and_load_all_data()
-            print("✅ 页面滚动和数据加载完成")
-        except Exception as e:
-            print(f"⚠️ 页面滚动过程中出现问题: {e}")
-
-        # 保存页面HTML用于后续分析
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        backup_html_path = f"portfolio_data_{portfolio_id}_{timestamp}.html"
-        
-        try:
-            with open(backup_html_path, 'w', encoding='utf-8') as f:
-                f.write(scraper.driver.page_source)
-            print(f"页面HTML已保存: {backup_html_path}")
-        except Exception as e:
-            print(f"保存HTML文件失败: {e}")
-
-        # 爬取数据
-        df = scraper.scrape_portfolio_data_improved()
-
-        if df is not None:
-            print("\n=== 📊 投资组合数据 ===")
-            print(f"成功提取 {len(df)} 条记录")
-            print("\n前10条数据:")
-            print(df.head(10).to_string())
-
-            # 保存到CSV
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            csv_file = f"portfolio_data_{timestamp}.csv"
-            df.to_csv(csv_file, index=False, encoding='utf-8-sig')
-            print(f"\n数据已保存到: {csv_file}")
-            
-            # 计算简化等权重再平衡策略
-            print("\n=== 🎯 开始计算简化等权重再平衡策略 ===")
-            
-            # 使用简化算法（使用默认配置）
-            rebalance_df = scraper.calculate_equal_weight_rebalance(df)
-            
-            print("\n💡 简化算法说明:")
-            print("- 等权重分配：每只股票获得相等的资金分配")
-            print("- 向上取整：目标股数按向上取整原则计算")
-            print("- 生成交易指令：比较当前持股与目标持股生成买卖操作")
-            
-            # 生成报告
-            print("\n=== 📋 生成再平衡报告 ===")
-            report = scraper.generate_rebalance_report(df, rebalance_df)
-            print(report)
-
+    if not os.path.exists(file_path):
+        print(f"错误: 文件不存在 - {file_path}")
+        if len(sys.argv) <= 1:
+            print("请确保 src/QuantPortfolios.html 文件存在，或使用命令行参数指定文件路径")
         else:
-            print("❌ 数据获取失败")
-            print("正在保存调试信息...")
-            scraper.save_debug_info("debug_failed_scrape.html")
+            print("请确保提供有效的MHTML或HTML文件路径")
+        return
+        
+    print(f"\n本地文件模式 - 文件: {file_path}")
+    print("=" * 50)
+    
+    # 创建配置（支持清仓功能演示）
+    config = RebalanceConfig(
+        min_trade_amount=200.0,
+        cash_adjustment=-20000,
+        liquidation_stocks=[]  # 可以在这里添加要清仓的股票
+    )
+    
+    # 执行数据处理+再平衡
+    rebalancer = PortfolioRebalancer(config)
+    trades_df, excel_path = rebalancer.scrape_and_rebalance(file_path)
+    
+    if trades_df is not None and not trades_df.empty:
+        print("\n交易指令预览:")
+        print(trades_df.to_string(index=False))
+        print(f"\nExcel报告已保存: {excel_path}")
+    else:
+        print("\n无需再平衡或数据处理失败")
+    
+    print("\n使用说明:")
+    print("- 默认模式: python src/portfolio_rebalancing.py")
+    print("- 指定文件: python src/portfolio_rebalancing.py <MHTML文件路径>")
+    print("- 清仓功能: 修改代码中的 liquidation_stocks 参数")
+    print("- 支持格式: .mhtml, .html 文件")
 
-    except Exception as e:
-        print(f"❌ 程序执行出错: {e}")
-        import traceback
-        traceback.print_exc()
 
-    finally:
-        scraper.close()
-
-
-
-
-def quick_analyze_portfolio(portfolio_id, target_stock_count=30, target_cash_amount=None, 
-                           target_cash_percentage=0.02, liquidate_symbols=None, exclude_symbols=None):
+def quick_scrape_and_rebalance(file_path: str, liquidation_stocks: List[str] = None) -> None:
     """
-    快速分析投资组合的便捷函数（分层处理策略）- 仅支持在线获取
+    快速本地文件解析和再平衡的便捷函数
     
     Args:
-        portfolio_id: 投资组合ID
-        target_stock_count: 目标股票数量 (默认30)
-        target_cash_amount: 目标固定现金金额 (优先级高于百分比)
-        target_cash_percentage: 目标现金比例 (默认2%)
-        liquidate_symbols: 需要清仓的股票代码列表
-        exclude_symbols: 排除的股票代码列表
-        
-    Returns:
-        投资组合数据DataFrame和再平衡数据DataFrame
+        file_path: 本地MHTML/HTML文件路径
+        liquidation_stocks: 要清仓的股票代码列表
     """
-    scraper = FixedSeekingAlphaScraper(use_existing_browser=True, debug_mode=False)
+    config = RebalanceConfig(
+        min_trade_amount=100.0,
+        cash_adjustment=0.0,
+        liquidation_stocks=liquidation_stocks or []
+    )
     
-    try:
-        # 在线获取数据
-        print(f"在线获取投资组合数据: {portfolio_id}")
-        df = scraper.scrape_portfolio_by_id(portfolio_id)
-        
-        if df is not None:
-            # 计算简化等权重再平衡（使用默认配置）
-            rebalance_df = scraper.calculate_equal_weight_rebalance(df)
-            
-            # 生成报告
-            report = scraper.generate_rebalance_report(df, rebalance_df, save_to_file=True)
-            print(report)
-            
-            return df, rebalance_df
-        else:
-            print("无法获取投资组合数据")
-            return None, None
-            
-    except Exception as e:
-        print(f"分析失败: {e}")
-        return None, None
-    finally:
-        scraper.close()
+    rebalancer = PortfolioRebalancer(config)
+    trades_df, excel_path = rebalancer.scrape_and_rebalance(file_path)
+    
+    print(f"\n完成! Excel报告: {excel_path}")
+    return trades_df, excel_path
 
 
 if __name__ == "__main__":
-    # 检查命令行参数
-    import sys
-    
-    if len(sys.argv) > 1:
-        # 第一个参数作为投资组合ID
-        portfolio_id = sys.argv[1]
-        print(f"使用指定的投资组合ID: {portfolio_id}")
-        main(portfolio_id)
-    else:
-        main()
+    main()
