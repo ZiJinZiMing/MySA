@@ -590,7 +590,7 @@ def main():
     # 创建配置（支持清仓功能演示）
     config = RebalanceConfig(
         min_trade_amount=200.0,
-        cash_adjustment=-20000,
+        cash_adjustment=0,
         liquidation_stocks=[]  # 可以在这里添加要清仓的股票
     )
     

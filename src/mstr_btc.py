@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup
 
 def get_btc_per_share():
     """
-    从strategytracker.com网站获取MSTR的BTC per Basic Share值
+    从saylortracker.com网站获取MSTR的每股BTC数量
     
     返回:
     float: 每股MSTR对应的BTC数量
@@ -39,7 +39,7 @@ def get_btc_per_share():
             print("成功启动新的Chrome浏览器实例")
         
         # 访问网站
-        url = "https://strategytracker.com/mstr?charts=nav-multiplier%2Cperformance-comparison%2Cbitcoin-price%2Cnav-premium%2Creserve-chart&timeRange=year"
+        url = "https://saylortracker.com/?tab=home"
         print(f"正在访问网站: {url}")
         driver.get(url)
         
@@ -49,54 +49,85 @@ def get_btc_per_share():
         print("页面加载完成")
         
         # 等待一段时间确保动态内容加载
-        time.sleep(3)
+        time.sleep(20)
         
-        # 获取页面内容
-        page_source = driver.page_source
-        soup = BeautifulSoup(page_source, 'html.parser')
-        
-        # 提取BTC per Basic Share信息
-        btc_per_share_text = None
-        
-        # 尝试方法1：直接查找包含"BTC per Basic Share"的元素
-        elements = driver.find_elements(By.XPATH, "//*[contains(text(), 'BTC per Basic Share')]")
-        if elements:
-            # 获取父元素
-            parent = elements[0].find_element(By.XPATH, "./..")
-            btc_per_share_text = parent.text
-            print(f"找到元素: {btc_per_share_text}")
-        
-        # 尝试方法2：如果方法1失败，使用更广泛的搜索
-        if not btc_per_share_text:
-            print("使用备用方法搜索...")
-            # 获取页面文本
+        # 获取页面文本内容
+        try:
             page_text = driver.find_element(By.TAG_NAME, "body").text
+            print("获取页面内容成功")
+        except Exception as e:
+            print(f"获取页面文本时出错: {e}")
+            # 尝试获取页面源码并解析
+            page_source = driver.page_source
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(page_source, 'html.parser')
+            page_text = soup.get_text()
+            print("使用BeautifulSoup获取页面文本")
+        
+        # 查找Sats Per Basic Share信息（新的页面结构）
+        sats_per_share = None
+        match = re.search(r"Sats Per Basic Share\s*([0-9,]+)", page_text, re.DOTALL)
+        if match:
+            sats_str = match.group(1).replace(",", "")
+            sats_per_share = int(sats_str)
+            # 将sats转换为BTC (1 BTC = 100,000,000 sats)
+            btc_per_share = sats_per_share / 100000000
+            print(f"找到Sats Per Basic Share: {sats_per_share:,} sats")
+            print(f"转换为BTC per Share: {btc_per_share:.8f} BTC")
             
-            # 使用正则表达式查找
-            match = re.search(r"BTC per Basic Share:?\s*([0-9.]+)", page_text)
-            if match:
-                btc_per_share_text = match.group(1)
-                print(f"通过正则表达式找到值: {btc_per_share_text}")
+            # 关闭新创建的浏览器（如果是新创建的）
+            try:
+                if driver.capabilities.get("chrome", {}).get("chromedriverArgs"):
+                    if "--headless" in " ".join(driver.capabilities["chrome"]["chromedriverArgs"]):
+                        driver.quit()
+                        print("已关闭新创建的Chrome浏览器")
+            except:
+                pass
+            
+            return btc_per_share
+        
+        # 备用方法：查找BTC Holdings和Basic Shares来计算
+        btc_holdings_match = re.search(r"₿([0-9,]+)", page_text)
+        basic_shares_match = re.search(r"([0-9.]+)M\s*285", page_text)  # 查找类似"285.88M"的模式
+        
+        if btc_holdings_match and basic_shares_match:
+            btc_holdings = float(btc_holdings_match.group(1).replace(",", ""))
+            basic_shares_millions = float(basic_shares_match.group(1))
+            basic_shares = basic_shares_millions * 1000000  # 转换为实际股数
+            
+            btc_per_share = btc_holdings / basic_shares
+            print(f"备用方法 - BTC Holdings: ₿{btc_holdings:,.0f}")
+            print(f"备用方法 - Basic Shares: {basic_shares:,.0f}")
+            print(f"备用方法 - BTC per Share: {btc_per_share:.8f}")
+            
+            # 关闭新创建的浏览器（如果是新创建的）
+            try:
+                if driver.capabilities.get("chrome", {}).get("chromedriverArgs"):
+                    if "--headless" in " ".join(driver.capabilities["chrome"]["chromedriverArgs"]):
+                        driver.quit()
+                        print("已关闭新创建的Chrome浏览器")
+            except:
+                pass
+            
+            return btc_per_share
+        
+        print("未能找到BTC per Share相关信息")
+        print("页面内容预览（前1000字符）:")
+        print(page_text[:1000])
         
         # 关闭新创建的浏览器（如果是新创建的）
-        if "--headless" in " ".join(driver.capabilities.get("chrome", {}).get("chromedriverArgs", [])):
-            driver.quit()
-            print("已关闭新创建的Chrome浏览器")
+        try:
+            if driver.capabilities.get("chrome", {}).get("chromedriverArgs"):
+                if "--headless" in " ".join(driver.capabilities["chrome"]["chromedriverArgs"]):
+                    driver.quit()
+                    print("已关闭新创建的Chrome浏览器")
+        except:
+            pass
         
-        # 提取数值
-        if btc_per_share_text:
-            # 如果找到了文本，提取数字部分
-            match = re.search(r"([0-9.]+)", btc_per_share_text)
-            if match:
-                btc_per_share = float(match.group(1))
-                print(f"成功获取BTC per Basic Share: {btc_per_share}")
-                return btc_per_share
-        
-        print("未能找到BTC per Basic Share信息")
         return None
     
     except Exception as e:
-        print(f"获取BTC per Basic Share时出错: {e}")
+        print(f"获取BTC per Share时出错: {e}")
         return None
 
 # 配置API密钥（可以通过环境变量设置，或直接在此处填写）
