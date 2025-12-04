@@ -18,6 +18,7 @@ import numpy as np
 import math
 import logging
 import os
+import re
 from datetime import datetime
 from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass
@@ -26,6 +27,12 @@ from dataclasses import dataclass
 from portfolio_data import parse_portfolio_basic
 
 logger = logging.getLogger(__name__)
+
+# 数据验证常量
+PRICE_MIN = 0.01
+PRICE_MAX = 1000000.0
+SHARES_MIN = 0.001
+SHARES_MAX = 10000000
 
 
 @dataclass
@@ -72,6 +79,7 @@ class TradeInstruction:
     current_value: float
     target_value: float
     reason: str
+    funding_supplement: float = 0.0  # 精准等权重模式下的资金补充金额
 
 
 class EqualWeightCalculator:
@@ -124,50 +132,108 @@ class EqualWeightCalculator:
         if portfolio_df is None or portfolio_df.empty:
             logger.error("投资组合数据为空")
             return False
-            
+
         required_columns = ['symbol', 'price', 'shares']
         missing_columns = [col for col in required_columns if col not in portfolio_df.columns]
         if missing_columns:
             logger.error(f"缺少必要列: {missing_columns}")
             return False
-            
+
+        # 检查重复股票代码
+        duplicates = portfolio_df[portfolio_df.duplicated(subset=['symbol'], keep=False)]
+        if not duplicates.empty:
+            logger.error(f"❌ 检测到重复股票代码: {duplicates['symbol'].unique().tolist()}")
+            logger.error("请检查数据源或使用去重处理")
+            return False
+
         return True
+
+    def _validate_stock_data(self, stock: pd.Series) -> Tuple[bool, str]:
+        """
+        验证单只股票的数据有效性
+
+        Args:
+            stock: 股票数据行
+
+        Returns:
+            (是否有效, 错误消息)
+        """
+        symbol = stock['symbol']
+
+        # 检查价格
+        if pd.isna(stock['price']):
+            return False, f"{symbol}: 价格为NaN"
+
+        price = float(stock['price'])
+        if price <= 0:
+            return False, f"{symbol}: 价格无效 (${price:.2f})"
+
+        if price < PRICE_MIN:
+            return False, f"{symbol}: 价格过低 (${price:.4f}), 最小{PRICE_MIN}"
+
+        if price > PRICE_MAX:
+            logger.warning(f"{symbol}: 价格异常高 (${price:,.2f}), 请确认数据准确性")
+
+        # 检查股数
+        if pd.isna(stock['shares']):
+            return False, f"{symbol}: 股数为NaN"
+
+        shares = float(stock['shares'])
+        if abs(shares) < SHARES_MIN:
+            return False, f"{symbol}: 持股接近0"
+
+        if abs(shares) > SHARES_MAX:
+            logger.warning(f"{symbol}: 持股数量异常大 ({shares:,.0f}), 请确认数据准确性")
+
+        return True, ""
     
     def _analyze_portfolio(self, portfolio_df: pd.DataFrame) -> PortfolioSummary:
         """分析投资组合"""
         # 计算value列：price * shares
         portfolio_df = portfolio_df.copy()
         portfolio_df['value'] = portfolio_df['price'] * portfolio_df['shares']
-        
+
         # 识别清仓股票（只处理投资组合中实际存在的）
-        actual_liquidation_stocks = [s for s in self.config.liquidation_stocks 
+        actual_liquidation_stocks = [s for s in self.config.liquidation_stocks
                                    if s in portfolio_df['symbol'].values]
-        
+
+        # 警告未找到的清仓股票
+        missing_liquidation = set(self.config.liquidation_stocks) - set(actual_liquidation_stocks)
+        if missing_liquidation:
+            logger.warning(f"⚠️ 以下股票不在投资组合中，无法清仓: {', '.join(missing_liquidation)}")
+
         # 分离清仓股票和等权重股票
         liquidation_df = portfolio_df[portfolio_df['symbol'].isin(actual_liquidation_stocks)]
         equal_weight_df = portfolio_df[~portfolio_df['symbol'].isin(actual_liquidation_stocks)]
-        
+
         total_value = portfolio_df['value'].sum()
         cash_value = 0  # 不再有现金行
         stock_value = total_value
         stock_count = len(portfolio_df)
-        
+
         # 清仓相关统计
         liquidation_value = liquidation_df['value'].sum()
         liquidation_count = len(liquidation_df)
         equal_weight_count = len(equal_weight_df)
-        
-        # 重新设计现金调整逻辑：清仓资金将加入等权重分配池
+
+        # 现金调整逻辑：清仓资金将加入等权重分配池
         if self.config.cash_adjustment > 0:
             # 追加投入：投资金额 = 当前总价值 + 追加金额
             investment_amount = total_value + self.config.cash_adjustment
+            logger.info(f"💰 追加投入${self.config.cash_adjustment:,.2f}，总投资金额${investment_amount:,.2f}")
         elif self.config.cash_adjustment < 0:
             # 保留现金：投资金额 = 当前总价值 - 保留金额(绝对值)
-            investment_amount = total_value - abs(self.config.cash_adjustment)
+            cash_to_reserve = abs(self.config.cash_adjustment)
+            if cash_to_reserve >= total_value:
+                logger.error(f"❌ 保留现金${cash_to_reserve:,.2f}超过或等于投资组合总价值${total_value:,.2f}")
+                raise ValueError("保留现金金额不能大于或等于投资组合总价值")
+            investment_amount = total_value - cash_to_reserve
+            logger.info(f"💰 保留现金${cash_to_reserve:,.2f}，可用于再平衡${investment_amount:,.2f}")
         else:
             # 不调整：投资金额 = 当前总价值
             investment_amount = total_value
-        
+            logger.info(f"💰 使用全部现有资金${investment_amount:,.2f}进行再平衡")
+
         return PortfolioSummary(
             total_value=total_value,
             cash_value=cash_value,
@@ -180,18 +246,28 @@ class EqualWeightCalculator:
         )
     
     def _calculate_target_amount(self, summary: PortfolioSummary) -> float:
-        """计算等权重股票的目标金额（清仓股票不参与等权重分配）"""
+        """
+        计算等权重股票的目标金额
+
+        清仓股票释放的资金会在交易执行时变成现金，
+        这些现金应该分配给剩余的等权重股票。
+        等权重资金池 = (总价值 + 现金调整) = investment_amount
+        """
         if summary.equal_weight_count == 0:
-            logger.warning("没有等权重股票数据")
+            if summary.liquidation_count > 0:
+                logger.info("✅ 所有股票都设置为清仓，无需计算等权重目标")
+            else:
+                logger.error("❌ 投资组合中没有股票数据")
             return 0.0
-            
-        # 等权重资金 = 总投资金额（包括清仓释放的资金）
-        target_amount = summary.investment_amount / summary.equal_weight_count
-        logger.info(f"💰 等权重股票目标金额: ${target_amount:,.2f} (共{summary.equal_weight_count}只股票)")
-        
+
+        # 清仓股票释放的资金已包含在 investment_amount 中
+        available_for_equal_weight = summary.investment_amount
+        target_amount = available_for_equal_weight / summary.equal_weight_count
+
+        logger.info(f"💰 等权重目标金额: ${target_amount:,.2f}/股 (共{summary.equal_weight_count}只)")
         if summary.liquidation_count > 0:
-            logger.info(f"🗑️ 清仓股票: {summary.liquidation_count}只，价值${summary.liquidation_value:,.2f}")
-            
+            logger.info(f"   清仓{summary.liquidation_count}只股票，释放${summary.liquidation_value:,.2f}资金用于再平衡")
+
         return target_amount
     
     def _generate_trades(self, portfolio_df: pd.DataFrame, target_amount_per_stock: float) -> List[TradeInstruction]:
@@ -200,18 +276,18 @@ class EqualWeightCalculator:
         # 计算value列：price * shares
         stocks_df = portfolio_df.copy()
         stocks_df['value'] = stocks_df['price'] * stocks_df['shares']
-        
+
         # 识别清仓股票（只处理投资组合中实际存在的）
-        actual_liquidation_stocks = [s for s in self.config.liquidation_stocks 
+        actual_liquidation_stocks = [s for s in self.config.liquidation_stocks
                                    if s in stocks_df['symbol'].values]
-        
+
         # 1. 先处理清仓股票（全部卖出）
         for _, stock in stocks_df.iterrows():
             if stock['symbol'] in actual_liquidation_stocks:
                 trade = self._calculate_liquidation_trade(stock)
                 if trade:
                     trades.append(trade)
-        
+
         # 2. 再处理等权重股票
         for _, stock in stocks_df.iterrows():
             if stock['symbol'] not in actual_liquidation_stocks:
@@ -219,92 +295,152 @@ class EqualWeightCalculator:
                 if trade:
                     trades.append(trade)
 
+        # 3. 验证资金平衡性
+        if trades:
+            total_buy = sum(t.amount for t in trades if t.action == 'BUY')
+            total_sell = sum(t.amount for t in trades if t.action == 'SELL')
+            net_cash_flow = total_buy - total_sell
+
+            # 计算预期现金流
+            expected_cash_flow = self.config.cash_adjustment
+
+            # 允许1%的误差（由于股数取整）+ 最小容差$100
+            tolerance = abs(expected_cash_flow) * 0.01 + 100
+
+            if abs(net_cash_flow - expected_cash_flow) > tolerance:
+                logger.warning(f"⚠️ 资金平衡性检查: 净现金需求${net_cash_flow:,.2f}, 预期${expected_cash_flow:,.2f}, 差异${abs(net_cash_flow - expected_cash_flow):,.2f}")
+
+                # 在精准等权重模式下，差异是预期的
+                if not self.config.perfect_equal_weight:
+                    logger.warning(f"   这可能是由于股数取整或最小交易金额过滤造成的")
+
         return trades
 
     def _validate_funding_constraints(self, trades: List[TradeInstruction], summary: PortfolioSummary) -> bool:
-        """验证资金补充约束"""
+        """
+        验证资金补充约束
+
+        计算净资金需求 = 总买入金额 - 总卖出金额
+        资金补充需求 = 净资金需求 - 现金调整
+        """
         if not self.config.perfect_equal_weight or not self.config.allow_additional_funding:
             return True
 
-        # 计算总的资金补充需求
-        total_funding_needed = 0
-        for trade in trades:
-            if trade.action == 'BUY':
-                # 对于买入交易，计算超出原始目标金额的部分
-                original_target = summary.investment_amount / summary.equal_weight_count
-                actual_target = trade.target_value
-                additional_funding = actual_target - original_target
-                if additional_funding > 0:
-                    total_funding_needed += additional_funding
+        # 计算净资金需求
+        total_buy_amount = sum(t.amount for t in trades if t.action == 'BUY')
+        total_sell_amount = sum(t.amount for t in trades if t.action == 'SELL')
+        net_cash_needed = total_buy_amount - total_sell_amount
+
+        # 资金补充 = 净需求 - 现有现金调整
+        funding_needed = max(0, net_cash_needed - self.config.cash_adjustment)
 
         # 检查比例限制
         if self.config.max_funding_ratio is not None:
             max_funding_by_ratio = summary.investment_amount * self.config.max_funding_ratio
-            if total_funding_needed > max_funding_by_ratio:
-                logger.warning(f"💰 资金补充需求${total_funding_needed:,.2f}超出比例限制${max_funding_by_ratio:,.2f} ({self.config.max_funding_ratio*100:.1f}%)")
+            if funding_needed > max_funding_by_ratio:
+                logger.warning(f"💰 资金补充需求${funding_needed:,.2f}超出比例限制${max_funding_by_ratio:,.2f} ({self.config.max_funding_ratio*100:.1f}%)")
                 return False
 
         # 检查绝对金额限制
         if self.config.max_funding_absolute is not None:
-            if total_funding_needed > self.config.max_funding_absolute:
-                logger.warning(f"💰 资金补充需求${total_funding_needed:,.2f}超出绝对限制${self.config.max_funding_absolute:,.2f}")
+            if funding_needed > self.config.max_funding_absolute:
+                logger.warning(f"💰 资金补充需求${funding_needed:,.2f}超出绝对限制${self.config.max_funding_absolute:,.2f}")
                 return False
 
-        if total_funding_needed > 0:
-            funding_ratio = total_funding_needed / summary.investment_amount * 100
-            logger.info(f"💰 精准等权重需要补充资金: ${total_funding_needed:,.2f} ({funding_ratio:.2f}%)")
+        if funding_needed > 0:
+            funding_ratio = funding_needed / summary.investment_amount * 100
+            logger.info(f"💰 精准等权重需要补充资金: ${funding_needed:,.2f} ({funding_ratio:.2f}%)")
 
         return True
     
     def _calculate_liquidation_trade(self, stock: pd.Series) -> Optional[TradeInstruction]:
         """计算清仓交易指令"""
-        current_shares = int(stock['shares'])
-        
+        # 验证数据有效性
+        is_valid, error_msg = self._validate_stock_data(stock)
+        if not is_valid:
+            logger.warning(f"⚠️ 跳过无效股票: {error_msg}")
+            return None
+
+        current_shares_raw = float(stock['shares'])
+
         # 如果已经没有持股，跳过
-        if current_shares <= 0:
+        if abs(current_shares_raw) < SHARES_MIN:
             logger.debug(f"{stock['symbol']}: 已无持股，跳过清仓")
             return None
-            
-        # 全部卖出
-        trade_amount = current_shares * stock['price']
-        
+
+        # 检查是否为整数股
+        is_whole_shares = abs(current_shares_raw - round(current_shares_raw)) < 0.001
+        if not is_whole_shares:
+            logger.warning(f"{stock['symbol']}: 检测到碎股持仓 {current_shares_raw:.3f} 股")
+
+        # 处理做空情况（负持股）
+        if current_shares_raw < 0:
+            # 做空平仓 = 买入
+            shares_to_trade = int(abs(current_shares_raw))
+            action = 'BUY'
+            reason = '清仓平仓（做空）'
+            logger.info(f"{stock['symbol']}: 检测到做空持仓，清仓需要买入{shares_to_trade}股")
+        else:
+            # 做多平仓 = 卖出
+            shares_to_trade = int(current_shares_raw)
+            action = 'SELL'
+            reason = '清仓卖出'
+
+        trade_amount = shares_to_trade * stock['price']
+
         # 过滤小额交易
         if trade_amount < self.config.min_trade_amount:
             logger.debug(f"{stock['symbol']}: 清仓金额${trade_amount:.2f}小于最小阈值${self.config.min_trade_amount}，跳过")
             return None
-            
+
         return TradeInstruction(
             symbol=stock['symbol'],
-            action='SELL',
-            shares=current_shares,
+            action=action,
+            shares=shares_to_trade,
             price=stock['price'],
             amount=trade_amount,
-            current_shares=current_shares,
+            current_shares=int(current_shares_raw),
             target_shares=0,
-            current_value=stock['value'],
+            current_value=current_shares_raw * stock['price'],
             target_value=0.0,
-            reason='清仓卖出'
+            reason=reason
         )
     
     def _calculate_single_trade(self, stock: pd.Series, target_amount: float) -> Optional[TradeInstruction]:
         """计算单只股票的交易指令"""
-        # 根据配置选择计算方式
+        # 验证数据有效性
+        is_valid, error_msg = self._validate_stock_data(stock)
+        if not is_valid:
+            logger.warning(f"⚠️ 跳过无效股票: {error_msg}")
+            return None
+
+        price = float(stock['price'])
+        current_shares_raw = float(stock['shares'])
+
+        # 检查是否为整数股
+        is_whole_shares = abs(current_shares_raw - round(current_shares_raw)) < 0.001
+        if not is_whole_shares:
+            logger.warning(f"{stock['symbol']}: 检测到碎股持仓 {current_shares_raw:.3f} 股")
+
+        # 计算目标股数
         if self.config.perfect_equal_weight and self.config.allow_additional_funding:
             # 精准等权重：使用向上取整实现完美等权重
-            target_shares = math.ceil(target_amount / stock['price'])
+            target_shares = math.ceil(target_amount / price)
         else:
-            # 传统方式：四舍五入
-            target_shares = int(np.round(target_amount / stock['price']))
+            # 传统方式：使用标准四舍五入（而非银行家舍入）
+            target_shares = int(target_amount / price + 0.5)
 
-        current_shares = int(stock['shares'])
+        # 当前持股（向下取整，保守处理碎股）
+        current_shares = int(current_shares_raw)
+
         share_diff = target_shares - current_shares
-        trade_amount = abs(share_diff) * stock['price']
-        target_value = target_shares * stock['price']
+        trade_amount = abs(share_diff) * price
+        target_value = target_shares * price
 
         # 计算实际资金补充量（仅在精准等权重模式下）
         additional_funding = 0
         if self.config.perfect_equal_weight and self.config.allow_additional_funding:
-            additional_funding = target_value - target_amount
+            additional_funding = max(0, target_value - target_amount)
 
         # 调试信息
         if self.config.perfect_equal_weight:
@@ -324,22 +460,24 @@ class EqualWeightCalculator:
         action = 'BUY' if share_diff > 0 else 'SELL'
 
         # 生成交易原因说明
+        current_value = current_shares_raw * price
         if self.config.perfect_equal_weight:
-            reason = f'精准等权重 (${stock["value"]:.0f} → ${target_value:.0f}, 补充${additional_funding:.0f})'
+            reason = f'精准等权重 (${current_value:.0f} → ${target_value:.0f}, 补充${additional_funding:.0f})'
         else:
-            reason = f'等权重调整 (${stock["value"]:.0f} → ${target_value:.0f})'
+            reason = f'等权重调整 (${current_value:.0f} → ${target_value:.0f})'
 
         return TradeInstruction(
             symbol=stock['symbol'],
             action=action,
             shares=abs(share_diff),
-            price=stock['price'],
+            price=price,
             amount=trade_amount,
             current_shares=current_shares,
             target_shares=target_shares,
-            current_value=stock['value'],
+            current_value=current_value,
             target_value=target_value,
-            reason=reason
+            reason=reason,
+            funding_supplement=additional_funding
         )
     
     def _log_portfolio_summary(self, summary: PortfolioSummary):
@@ -383,23 +521,15 @@ class EqualWeightCalculator:
         """记录交易摘要"""
         buy_trades = [t for t in trades if t.action == 'BUY']
         sell_trades = [t for t in trades if t.action == 'SELL']
-        liquidation_trades = [t for t in sell_trades if t.reason == '清仓卖出']
-        equal_weight_trades = [t for t in trades if t.reason != '清仓卖出']
+        liquidation_trades = [t for t in sell_trades if '清仓' in t.reason]
+        equal_weight_trades = [t for t in trades if '清仓' not in t.reason]
 
         total_buy_amount = sum(t.amount for t in buy_trades)
         total_sell_amount = sum(t.amount for t in sell_trades)
         liquidation_amount = sum(t.amount for t in liquidation_trades)
 
-        # 计算精准等权重的资金补充
-        total_funding_supplement = 0
-        if self.config.perfect_equal_weight and self.config.allow_additional_funding:
-            for trade in equal_weight_trades:
-                if "补充$" in trade.reason:
-                    # 从reason字符串中提取补充金额
-                    import re
-                    match = re.search(r'补充\$(\d+)', trade.reason)
-                    if match:
-                        total_funding_supplement += float(match.group(1))
+        # 计算精准等权重的资金补充（使用 funding_supplement 字段）
+        total_funding_supplement = sum(t.funding_supplement for t in trades)
 
         mode_name = "精准等权重再平衡摘要" if self.config.perfect_equal_weight else "简化等权重再平衡摘要"
         logger.info(f"\n💰 === {mode_name} ===")
@@ -418,7 +548,7 @@ class EqualWeightCalculator:
         if liquidation_trades:
             logger.info("🗑️ 清仓交易:")
             for trade in liquidation_trades:
-                logger.info(f"  {trade.symbol}: SELL {trade.shares} shares, ${trade.amount:,.2f}")
+                logger.info(f"  {trade.symbol}: {trade.action} {trade.shares} shares, ${trade.amount:,.2f}")
 
         if equal_weight_trades:
             mode_symbol = "🎯" if self.config.perfect_equal_weight else "⚖️"
@@ -722,9 +852,9 @@ def main():
     
     # 创建配置（支持清仓功能演示和精准等权重）
     config = RebalanceConfig(
-        min_trade_amount=0.0,
+        min_trade_amount=200,
         cash_adjustment=0,
-        liquidation_stocks=[],  # 可以在这里添加要清仓的股票
+        liquidation_stocks=['ARKW','DFEN'],  # 可以在这里添加要清仓的股票
         perfect_equal_weight=True,  # 设置为True启用精准等权重算法
         allow_additional_funding=True,
         max_funding_ratio=0.03,  # 最大资金补充比例3%
@@ -758,7 +888,7 @@ def quick_scrape_and_rebalance(file_path: str, liquidation_stocks: List[str] = N
         liquidation_stocks: 要清仓的股票代码列表
     """
     config = RebalanceConfig(
-        min_trade_amount=100.0,
+        min_trade_amount=200.0,
         cash_adjustment=0.0,
         liquidation_stocks=liquidation_stocks or []
     )

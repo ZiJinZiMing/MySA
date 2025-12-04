@@ -238,18 +238,24 @@ class PortfolioHTMLParser:
             for ticker_elem in ticker_elements:
                 symbol = ticker_elem.get_text(strip=True)
                 
+                # 清理股票名称
+                symbol = symbol.replace(' ', '').strip()
+
                 # 跳过现金项目
                 if symbol.upper() in ['CASH', 'CURRENCY']:
                     self.logger.debug(f"跳过现金项目: {symbol}")
                     continue
-                
-                # 跳过无效的股票名称
-                if not symbol or len(symbol) < 2:
+
+                # 跳过空或无效的股票名称
+                # 注意：美国股市存在合法的单字符股票代码（如 W, F, X, C, T, V 等）
+                if not symbol or len(symbol.strip()) == 0:
                     self.logger.debug(f"跳过无效股票名称: '{symbol}'")
                     continue
-                
-                # 清理股票名称
-                symbol = symbol.replace(' ', '').strip()
+
+                # 验证股票代码格式（允许字母、数字、点、连字符）
+                if not re.match(r'^[A-Za-z0-9.\-]+$', symbol):
+                    self.logger.debug(f"跳过格式无效的股票代码: '{symbol}'")
+                    continue
                 
                 # 提取股票数据
                 stock_data = self._extract_stock_data(soup, ticker_elem, symbol)
