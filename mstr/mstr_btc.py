@@ -13,6 +13,7 @@ import time
 import re
 import os
 import threading
+import sqlite3
 from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -39,6 +40,7 @@ STRATEGY_URL = "https://www.strategy.com/"
 CHROME_DEBUG_PORT = 9222
 TICK_INTERVAL = 10  # 主循环更新间隔（秒）
 BTC_PER_SHARE_UPDATE_INTERVAL = 30000  # BTC per share 更新间隔（秒，500分钟）
+DB_FILE = "mstr_data.db"  # SQLite 数据库文件，用于可视化
 
 # 全局变量
 btc_per_share_global = None
@@ -276,7 +278,7 @@ def get_price_from_api(symbol):
 
 def calculate_premium(mstr_price, btc_price, btc_per_share, ev_adjustment=0):
     """
-    计算 MSTR 相对于其 BTC 持有量的溢价 (使用 Enterprise Value 方法)
+    计算 MSTR 相对于其 BTC 持有量的溢价 (同时返回市值溢价和 Enterprise Value 溢价)
 
     参数:
         mstr_price: MSTR 股票价格
@@ -285,22 +287,97 @@ def calculate_premium(mstr_price, btc_price, btc_per_share, ev_adjustment=0):
         ev_adjustment: (Debt + Pref - Cash) / Shares，用于计算 Enterprise Value
 
     返回:
-        float: 溢价百分比 (基于 Enterprise Value)
+        tuple: (market_cap_premium, ev_premium)
+            - market_cap_premium: 基于市值的溢价百分比
+            - ev_premium: 基于 Enterprise Value 的溢价百分比
     """
     if not all([mstr_price, btc_price, btc_per_share]):
-        return None
+        return None, None
 
     # 计算每股 MSTR 对应的 BTC 价值
     btc_value_per_share = btc_per_share * btc_price
+
+    # 计算市值溢价 (Market Cap Premium)
+    # 市值溢价 = (股价 / BTC价值 per share - 1) × 100%
+    market_cap_premium = (mstr_price / btc_value_per_share - 1) * 100
 
     # 计算 Enterprise Value per share
     # EV_per_share = Stock Price + (Debt + Pref - Cash) / Shares
     ev_per_share = mstr_price + ev_adjustment
 
-    # 计算溢价 (mNAV): (Enterprise Value per share / BTC价值 per share - 1) × 100%
-    premium = (ev_per_share / btc_value_per_share - 1) * 100
+    # 计算 EV 溢价 (mNAV): (Enterprise Value per share / BTC价值 per share - 1) × 100%
+    ev_premium = (ev_per_share / btc_value_per_share - 1) * 100
 
-    return premium
+    return market_cap_premium, ev_premium
+
+
+def init_database():
+    """
+    初始化 SQLite 数据库，创建数据表
+    """
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+
+        # 创建数据表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS mstr_premium (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME NOT NULL,
+                mstr_price REAL NOT NULL,
+                btc_price REAL NOT NULL,
+                btc_per_share REAL NOT NULL,
+                market_cap_premium REAL NOT NULL,
+                ev_premium REAL NOT NULL,
+                ev_adjustment REAL DEFAULT 0
+            )
+        ''')
+
+        # 创建索引加速查询
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_timestamp
+            ON mstr_premium(timestamp DESC)
+        ''')
+
+        conn.commit()
+        conn.close()
+        print(f"数据库初始化成功: {DB_FILE}", flush=True)
+
+    except Exception as e:
+        print(f"数据库初始化失败: {e}", flush=True)
+
+
+def save_to_database(timestamp, mstr_price, btc_price, btc_per_share,
+                     market_cap_premium, ev_premium, ev_adjustment):
+    """
+    保存溢价数据到 SQLite 数据库
+
+    参数:
+        timestamp: 时间戳
+        mstr_price: MSTR 价格
+        btc_price: BTC 价格
+        btc_per_share: 每股 BTC 数量
+        market_cap_premium: 市值溢价百分比
+        ev_premium: EV 溢价百分比
+        ev_adjustment: EV 调整值
+    """
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            INSERT INTO mstr_premium
+            (timestamp, mstr_price, btc_price, btc_per_share,
+             market_cap_premium, ev_premium, ev_adjustment)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (timestamp, mstr_price, btc_price, btc_per_share,
+              market_cap_premium, ev_premium, ev_adjustment))
+
+        conn.commit()
+        conn.close()
+
+    except Exception as e:
+        print(f"保存数据到数据库失败: {e}", flush=True)
 
 
 def update_btc_per_share_periodically():
@@ -348,8 +425,12 @@ def main():
     print(f"BTC per Share 更新间隔: {BTC_PER_SHARE_UPDATE_INTERVAL} 秒", flush=True)
     print("="*60, flush=True)
 
+    # 初始化数据库
+    print("\n初始化数据库...", flush=True)
+    init_database()
+
     # 初始化: 首次获取 BTC per share
-    print("\n初始化：获取 BTC per Share 数据...", flush=True)
+    print("初始化：获取 BTC per Share 数据...", flush=True)
     btc_per_share_global, ev_adjustment_global = get_btc_per_share_from_strategy()
 
     if not btc_per_share_global:
@@ -391,13 +472,25 @@ def main():
             mstr_price = get_price_from_api("MSTR")
             btc_price = get_price_from_api("BINANCE:BTCUSDT")
 
-            # 计算并输出溢价 (使用 Enterprise Value 方法)
+            # 计算并输出溢价 (同时计算市值溢价和 EV 溢价)
             if mstr_price and btc_price:
-                premium = calculate_premium(mstr_price, btc_price, current_btc_per_share, current_ev_adjustment)
+                market_cap_premium, ev_premium = calculate_premium(mstr_price, btc_price, current_btc_per_share, current_ev_adjustment)
 
-                if premium is not None:
+                if market_cap_premium is not None and ev_premium is not None:
                     # 格式化输出，flush=True 确保立即显示
-                    print(f"{current_time}:: [MSTR: ${mstr_price:.2f}]||[BTC: ${btc_price:,.2f}]||[溢价: {premium:.2f}%]", flush=True)
+                    # 显示两种溢价：市值溢价（更直观）和 EV 溢价（考虑债务）
+                    print(f"{current_time}:: [MSTR: ${mstr_price:.2f}]||[BTC: ${btc_price:,.2f}]||[市值溢价: {market_cap_premium:.2f}%]||[EV溢价: {ev_premium:.2f}%]", flush=True)
+
+                    # 保存数据到数据库
+                    save_to_database(
+                        timestamp=current_time,
+                        mstr_price=mstr_price,
+                        btc_price=btc_price,
+                        btc_per_share=current_btc_per_share,
+                        market_cap_premium=market_cap_premium,
+                        ev_premium=ev_premium,
+                        ev_adjustment=current_ev_adjustment
+                    )
                 else:
                     print(f"{current_time}:: 计算溢价失败", flush=True)
             else:
